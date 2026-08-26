@@ -1,8 +1,9 @@
 # claude-code-keyboard-status
 
 Live [Claude Code](https://claude.com/claude-code) state on the 142×428 image
-display of a mechanical keyboard: what Claude is doing right now, which model is
-answering, and how much of your 5-hour and weekly budget is gone.
+display of a mechanical keyboard — 2.79 in of glass, read from where your hands
+already are: what Claude is doing right now, which model is answering, and how much
+of your 5-hour and weekly budget is gone.
 
 ![the four states](docs/states.png)
 
@@ -11,9 +12,9 @@ project name, but you can tell a spinning orange bloom from a sleeping one — a
 yellow badge means Claude is blocked on a permission prompt and has been waiting
 for you.
 
-The panel carries five facts and no more. It is read at arm's length, at a glance,
-in whatever light the desk has, so everything on it is set large enough to survive
-that — which leaves room for five things, not nine.
+The panel carries four facts and no more, each set large enough to read without
+leaning in. That number is not a style choice — it falls out of the arithmetic
+below.
 
 ## Install
 
@@ -58,63 +59,126 @@ Your `keyboard-status.json` is left alone, and so is
 
 ## What it shows
 
-| Cell | Size | Notes |
+| Cell | Set at | Reads as |
 | --- | --- | --- |
-| character | 100 px | the session state, as a pose — see the table below |
-| state badge | 15 px | the same thing in words, for when you are close enough to read it |
-| `MODEL` | 22 px | `Opus 5`, `Sonnet 5`, … resolved from the session transcript |
-| effort chip | 11 px | rides on the `MODEL` label row, when an effort is set |
-| `5 HR` | 24 px + 15 px bar | 5-hour usage window: percentage and meter |
-| `WEEK` | 24 px + 15 px bar | weekly usage window, same |
-| footer | 15 px | render clock, and a dot for whether the last POST landed |
+| character | 106 px / 16.7 mm | the session state, as a pose — see the table below |
+| state badge | 25 px cap / 22.5′ | `BUSY` · `YOU` · `IDLE` · `OFF` |
+| model | 24 px cap / 21.6′ | `Opus 5`, `Sonnet 5`, … auto-fitted to the width |
+| `5H` / `7D` | 25 px cap / 22.5′ | percent of the 5-hour and weekly windows used, over a 20 px meter |
 
-Bars are green below 50%, amber to 75%, orange to 90%, red above.
+Meters are green below 50%, amber to 75%, orange to 90%, red above.
+
+## How the sizes were chosen
+
+Not by eye. The panel is **2.79 in** on the diagonal at 142×428, which fixes
+everything else:
+
+```
+diagonal   sqrt(142² + 428²) = 450.9 px
+density    450.9 / 2.79      = 161.6 ppi   →  1 px = 0.157 mm
+physical   22.3 mm × 67.3 mm               →  narrower than a finger
+```
+
+Read while typing, the keyboard sits about **600 mm** from your eyes. Character
+height for a given visual angle is `D · tan(arcmin / 60°)`, so at that distance:
+
+| Visual angle | Character height | Meaning |
+| --- | --- | --- |
+| 16′ | 2.79 mm → **17.8 px** cap | the comfortable floor |
+| 22′ | 3.84 mm → **24.4 px** cap | easy at a glance — **the target** |
+| 28′ | 4.89 mm → **31.1 px** cap | low light, peripheral vision |
+
+San Francisco's cap height measures **0.71–0.73** of PIL's `size` parameter —
+measured with `textbbox`, not assumed, because the ratio wanders by a point or two
+with hinting — so 24.4 px of cap height is **`size` 34**. That is `CORE_SIZE`, and
+everything the panel exists to tell you is set there.
+
+The corollary is the part that took a redesign to accept: **161.6 ppi on a 22 mm
+strip does not buy detail, it buys about six legible characters per line.** 428 px
+of height is a high number attached to a very small piece of glass.
+
+So width, not height, is what decides the vocabulary:
+
+| At `CORE_SIZE` | Width | vs. 122 px available |
+| --- | --- | --- |
+| `NEEDS YOU` | 192 px | doesn't fit; best case is `size` 22 → **14.4′**, under the floor |
+| `WORKING` | 163 px | doesn't fit; best case `size` 25 → **16.2′**, at the floor |
+| `5H 100%` | 145 px | doesn't fit |
+| `Haiku 4.5` | 153 px | doesn't fit; best case `size` 27 → 18.0′ |
+| `BUSY` | 92 px | fits |
+| `Opus 5` | 113 px | fits |
+| `5H` + `100` | 107 px | fits |
+
+Hence the three changes that look like aesthetic decisions and are not:
+
+- **The state words got shorter, not smaller.** `NEEDS YOU` cannot reach even the
+  16′ floor in 122 px. Colour and pose were already carrying the nuance those
+  extra letters added, so `BUSY` · `YOU` · `IDLE` · `OFF` it is.
+- **The per-cent sign went.** `5H 100%` is 145 px; `5H` + `100` is 107. A number
+  sitting on top of a meter does not need the glyph, and keeping it would have
+  meant shrinking both.
+- **The model name auto-fits.** `Opus 5` clears the target outright; `Haiku 4.5` is
+  three characters longer than the panel can carry at that size and gets `size` 27
+  (18.0′) rather than dragging every other name down to the worst case. The row
+  reserves the full height either way, so nothing below it moves.
+
+`--status` still prints everything, at any length, in a terminal that has room.
 
 ### The top 40 rows are not yours
 
 The physical panel sits behind the device's own cutouts, so the first 40 rows are
 covered — not dim, not cropped, gone. `DEAD_ZONE` records that, every vertical
-coordinate is derived from `MASCOT_TOP` below it, and the preview script asserts no
-frame puts a single non-background pixel above the line. That leaves 358 usable
-rows, which is the constraint the whole layout is solved against.
+coordinate is derived from `MASCOT_TOP` below it, and `docs/make_preview.py` fails
+the build if any state puts a single non-background pixel above the line. That
+leaves **358 usable rows**, which is the budget the layout is solved against.
 
 ### What is deliberately missing
 
-The project name, the git branch, the session title and the reset countdowns used to
-be here, at 9–10 px. They are gone, and the space went into type you can actually
-read at arm's length. Each was a fair trade:
+The project name, the git branch, the session title, the reset countdowns, the
+effort chip, the footer clock and the "last activity" stamp were all here once, at
+9–15 px — which is **7–11 arcmin** from where this thing is read. Each was a cell
+you could see but not read, and a cell you cannot read is worse than no cell,
+because it still costs the space. The trades:
 
-- **project and branch** — you know which repo you are in; the terminal in front of
-  you says so.
-- **session title / prompt** — a wrapped sentence is the one thing on a 142 px panel
-  that can never be glanceable. Reading it means leaning in, and if you are leaning
-  in you may as well look at the terminal.
-- **reset countdowns** — the least urgent usage fact, and the one that costs a whole
-  row per meter. `--status` still prints them.
-- **"last activity" stamp** — the character already answers that question.
+- **project and branch** — you know which repo you are in; the terminal says so.
+- **session title / prompt** — a wrapped sentence is the one thing a 22 mm strip
+  can never make glanceable. Reading it means leaning in, and if you are leaning
+  in, the terminal is right there.
+- **reset countdowns** — the least urgent usage fact, and a whole row per meter.
+- **effort** — needs its own row at a readable size, and `MODEL` outranks it.
+- **clock and activity stamp** — your computer has a clock, and the character
+  already answers "is anything happening".
 
-All of it is still collected; `--status` dumps everything the renderer could see.
+All of it is still collected. Only the drawing stopped.
 
 ## The four states
 
-| | Pose | Means |
+| Badge | Pose | Means |
 | --- | --- | --- |
-| **working** | clay bloom, turning, eyes tracking, sparks | a turn is in flight, or the transcript grew in the last 45 s |
-| **waiting** | amber, wide eyes, `!` badge | Claude asked for permission and is blocked on you |
-| **idle** | dusty rose, eyes closed, `z` | the turn ended, or nothing has happened for a while |
-| **offline** | grey, flat eyes | no session found at all |
+| **`BUSY`** | clay bloom, turning, eyes tracking | a turn is in flight, or the transcript grew in the last 45 s |
+| **`YOU`** | amber, wide eyes, `!` badge | Claude asked for permission and is blocked on you |
+| **`IDLE`** | dusty rose, eyes closed, `z` | the turn ended, or nothing has happened for a while |
+| **`OFF`** | grey, flat eyes | no session found at all |
 
 The bloom advances a few degrees every tick while working, which makes "still
 alive" legible without reading anything. In every other state it holds still.
+
+At 16.7 mm across, the character is the one element far above every readability
+threshold, which is why it carries the fact you most need from across a desk. It
+used to throw three twinkles onto a wide orbit while working; they were ~9 arcmin
+— under the threshold where anything resolves — and that orbit, not the bloom, was
+what capped the character's size, because it clipped both margins first. Dropping
+them bought 6 px of bloom, which you can actually see.
 
 ## Why a daemon *and* hooks
 
 Neither half can do this job alone, and the split falls along the grain of the data.
 
-**A hook-only design goes stale the moment you stop typing.** The clock and both
-usage meters move on wall-clock time, not on anything a session does. A display that
-only redraws on session events freezes at whatever it last saw and then quietly lies
-for hours, which is worse than showing nothing.
+**A hook-only design goes stale the moment you stop typing.** Both usage meters
+move on wall-clock time, not on anything a session does — a weekly window refills
+while you are asleep. A display that only redraws on session events freezes at
+whatever it last saw and then quietly lies for hours, which is worse than showing
+nothing.
 
 **A daemon-only design cannot see state.** Whether Claude is thinking, waiting for
 you to approve a tool call, or finished, is delivered to hook commands and written
@@ -149,9 +213,11 @@ hook fired as proof the hook is behind, and otherwise falls back to liveness.
 ## Why it only pushes sometimes
 
 The daemon renders every tick and pushes only when the JPEG actually changed, or
-when the last successful push is more than five minutes old. In practice that is one
-upload a minute while idle — the clock cell rolling over — and one per tick while
-Claude is working and the character is turning.
+when the last successful push is more than five minutes old. Now that the clock is
+gone there is nothing on an idle panel that changes on its own until a usage
+percentage rolls over, so idle traffic is the five-minute heartbeat and nothing
+else. While Claude is working the character is turning, so every tick differs and
+every tick uploads.
 
 The heartbeat exists because the keyboard is not a reliable store: it reboots, gets
 unplugged, and drops what it was showing. Five minutes is the longest it can display
@@ -193,10 +259,14 @@ response cannot stall the display.
 | `session_ttl_seconds` | `21600` | after this, a session stops being the current one |
 | `usage_poll_seconds` | `60` | shared with claude-status-bar's own throttle |
 
-Layout constants (`DEAD_ZONE`, `MASCOT_TOP`, `MASCOT_SIZE`, `PILL_H`, `BAR_H`,
-`FOOTER_H`) sit at the top of the drawing section in `keyboard_status.py`. They are
-code rather than config because they only make sense together: change one and the
+Layout and readability constants (`CORE_SIZE`, `FLOOR_SIZE`, `DEAD_ZONE`,
+`MASCOT_TOP`, `MASCOT_SIZE`, `BAR_H`, the `GAP_*` set) sit above `render()` in
+`keyboard_status.py`, under a comment carrying the arithmetic above. They are code
+rather than config because they only make sense together: change one and the
 vertical budget has to be re-solved.
+
+If your panel is a different physical size, `CORE_SIZE` is the number to redo —
+recompute ppi from the diagonal, pick your viewing distance, and take 22 arcmin.
 
 `CLAUDE_KEYBOARD_URL`, `CLAUDE_KEYBOARD_TICK`, `CLAUDE_KEYBOARD_HEARTBEAT`,
 `CLAUDE_KEYBOARD_TIMEOUT` and `CLAUDE_KEYBOARD_QUALITY` override the file, which is
@@ -232,6 +302,10 @@ for a bigger future panel rather than for this one.
 The top 40 rows of that panel are behind the device's own cutouts — see
 [the top 40 rows are not yours](#the-top-40-rows-are-not-yours). If your keyboard's
 dead zone is a different height, change `DEAD_ZONE` and `MASCOT_TOP` together.
+
+At 2.79 in on the diagonal that is 161.6 ppi over 22.3 mm × 67.3 mm — see
+[how the sizes were chosen](#how-the-sizes-were-chosen), which is most of why this
+layout looks the way it does.
 
 ## Known limitations
 

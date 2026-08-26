@@ -750,11 +750,16 @@ WARN = (232, 176, 75)
 BAD = (224, 108, 90)
 SLEEP = (108, 118, 132)
 
+# Short because they have to be. Across the 122 px between the margins, "NEEDS
+# YOU" tops out at 14 arcmin and "WORKING" at 16 -- at or below the floor where
+# type stops being glanceable -- while four characters clear the 22 arcmin target
+# outright. The words got shorter rather than smaller; colour and pose already
+# carry the nuance the extra letters were adding.
 STATE_STYLE = {
-    "working": ("WORKING", CLAY),
-    "waiting": ("NEEDS YOU", WARN),
+    "working": ("BUSY", CLAY),
+    "waiting": ("YOU", WARN),
     "idle": ("IDLE", SLEEP),
-    "offline": ("NO SESSION", FAINT),
+    "offline": ("OFF", FAINT),
 }
 
 # Supersampling factor for every vector shape. FreeType antialiases text for us;
@@ -847,30 +852,51 @@ def measure(draw, text, fonts):
     return sum(draw.textlength(chunk, font=fonts[1 if wide else 0]) for wide, chunk in runs(text))
 
 
-def write(draw, x, y, text, fonts, fill, align="left", max_width=None, spacing=0.0):
-    """Draw a possibly-mixed-script string, optionally letterspaced. Returns width.
+def write(draw, x, y, text, fonts, fill, align="left", max_width=None):
+    """Draw a possibly-mixed-script string. Returns the width it took.
 
-    `spacing` exists for the small uppercase section labels: PIL has no tracking
-    control, and at 9 px an untracked all-caps label reads as one grey smudge.
+    Nothing is letterspaced any more: tracking was there to keep 9 px all-caps
+    labels from reading as one grey smudge, and there is no 9 px type left.
     """
     if max_width is not None:
         text = elide(draw, text, fonts, max_width)
-    width = measure(draw, text, fonts) + spacing * max(0, len(text) - 1)
+    width = measure(draw, text, fonts)
     if align == "center":
         x -= width / 2
     elif align == "right":
         x -= width
-    if spacing:
-        for char in text:
-            face = fonts[1 if _is_wide(char) else 0]
-            draw.text((x, y), char, font=face, fill=fill)
-            x += draw.textlength(char, font=face) + spacing
-    else:
-        for wide, chunk in runs(text):
-            face = fonts[1 if wide else 0]
-            draw.text((x, y), chunk, font=face, fill=fill)
-            x += draw.textlength(chunk, font=face)
+    for wide, chunk in runs(text):
+        face = fonts[1 if wide else 0]
+        draw.text((x, y), chunk, font=face, fill=fill)
+        x += draw.textlength(chunk, font=face)
     return width
+
+
+def cap_box(draw, fonts, sample="8"):
+    """(anchor-to-ink-top offset, ink height) for a cap-height glyph in `fonts`.
+
+    The layout is solved in cap heights, because cap height is what the
+    visual-angle arithmetic above is about. PIL's own origin is ascender-relative
+    and the gap between the two drifts with size, so every row is placed by where
+    its ink actually starts rather than by where PIL would like to begin drawing.
+    """
+    box = draw.textbbox((0, 0), sample, font=fonts[0])
+    return box[1], box[3] - box[1]
+
+
+def fit(draw, text, max_width, sizes, weight=700, rounded=True):
+    """The largest of `sizes` at which `text` fits `max_width`; the smallest if none.
+
+    Model names run from "Opus 5" to "Haiku 4.5" -- a third more width for the same
+    row. Setting the row to whatever the longest name needs would punish every
+    frame for the worst case, so each frame gets the biggest type its own name
+    allows and the caller reserves the space either way.
+    """
+    for size in sizes:
+        fonts = font(size, weight, rounded=rounded)
+        if measure(draw, text, fonts) <= max_width:
+            return fonts
+    return font(sizes[-1], weight, rounded=rounded)
 
 
 def elide(draw, text, fonts, max_width):
@@ -990,17 +1016,13 @@ def draw_mascot(draw, cx, cy, size, state, phase):
                       cx + size * 0.045, mouth_y + size * 0.045], fill=dark)
 
     # --------------------------------------------------------------- accessories
-    if state == "working":
-        for index in range(3):
-            angle = -phase * 1.6 + index * 2 * math.pi / 3
-            radius = size * 0.66
-            sx, sy = cx + math.cos(angle) * radius, cy + math.sin(angle) * radius * 0.82
-            twinkle = 0.45 + 0.55 * math.sin(phase * 2.2 + index * 2.1)
-            arm = size * (0.038 + 0.030 * twinkle)
-            tint = (247, 196, 150) + (int(120 + 135 * twinkle),)
-            capsule(draw, (sx - arm, sy), (sx + arm, sy), size * 0.011, size * 0.011, tint)
-            capsule(draw, (sx, sy - arm), (sx, sy + arm), size * 0.011, size * 0.011, tint)
-    elif state == "waiting":
+    # The working state used to throw three twinkles onto an orbit at 0.66 * size.
+    # They were 10 px across -- about 9 arcmin from where this panel is read, below
+    # the threshold where anything resolves -- and that orbit is what capped the
+    # character's size, because it clipped both margins before the rays did.
+    # Dropping them bought 6 px of bloom, which is legible. The turning is the
+    # "still alive" signal; the sparks were only ever decoration.
+    if state == "waiting":
         # A badge, so the one state that wants your attention has a silhouette you
         # can recognise before you have read a single word.
         bx, by = cx + size * 0.42, cy - size * 0.42
@@ -1014,19 +1036,47 @@ def draw_mascot(draw, cx, cy, size, state, phase):
 # -------------------------------------------------------------------------- layout
 
 PAD = 10                     # side margin; everything lives inside it
-LABEL_SPACING = 1.2          # tracking for the small uppercase section labels
-STATE_TRACKING = 1.0         # the state badge is set larger, so it needs less
+
+# ------------------------------------------------------------------ readability
+#
+# The panel is 2.79 in on the diagonal at 142x428 px, and that one number decides
+# the whole layout:
+#
+#   diagonal   sqrt(142^2 + 428^2) = 450.9 px
+#   density    450.9 / 2.79        = 161.6 ppi   ->  1 px = 0.157 mm
+#   physical   22.3 mm x 67.3 mm                 ->  narrower than a finger
+#
+# Read while typing, it sits roughly 600 mm from your eyes. Character height for
+# a given visual angle is D * tan(arcmin / 60 degrees), so at that distance:
+#
+#   16 arcmin -> 2.79 mm -> 17.8 px of cap height   the comfortable floor
+#   22 arcmin -> 3.84 mm -> 24.4 px of cap height   easy at a glance  <- target
+#   28 arcmin -> 4.89 mm -> 31.1 px of cap height   low light, peripheral
+#
+# San Francisco's cap height measures 0.71-0.73 of PIL's size parameter (measured,
+# not assumed -- the ratio wanders by a point or two with hinting), so 24.4 px of
+# cap height is size 34. Everything the panel exists to tell you is set there.
+#
+# The corollary is the part that took a redesign to accept: 161.6 ppi on a 22 mm
+# strip does not buy detail, it buys about six legible characters per line. Words
+# that could not be said in six were shortened or dropped, not shrunk -- a cell
+# nobody can read is worse than no cell, because it still costs the space.
+CORE_SIZE = 34               # 25 px cap = 22 arcmin at 600 mm
+FLOOR_SIZE = 25              # 18 px cap = 16 arcmin; nothing readable goes below
+MODEL_SIZES = tuple(range(CORE_SIZE, FLOOR_SIZE - 1, -1))
 
 # The top of the physical panel sits behind the device's own cutouts, so the
 # first 40 rows are unusable -- not dim, not cropped, covered. Every coordinate
 # below is derived from MASCOT_TOP so nothing can drift back up into them.
 DEAD_ZONE = 40
 MASCOT_TOP = 44              # first row the character is allowed to touch
-MASCOT_SIZE = 100            # its outermost glow reaches MASCOT_REACH * this
+MASCOT_SIZE = 106            # its outermost glow reaches MASCOT_REACH * this
 MASCOT_REACH = 0.63          # matches the last ring draw_mascot paints
-PILL_H = 28                  # state badge
-BAR_H = 15                   # usage meter
-FOOTER_H = 30                # rule, clock and reachability dot
+PILL_PAD = 11                # ink-to-edge inside the state badge
+BAR_H = 20                   # 3.1 mm: a meter you read as a shape, not as a line
+GAP_MASCOT = 13              # character to badge
+GAP_SECTION = 18             # between the badge, the model and the two meters
+GAP_BAR = 6                  # a meter's number to its bar
 
 
 def usage_color(pct):
@@ -1046,11 +1096,11 @@ def render(status, now, config, phase=0.0):
     that is resampled down for antialiasing, then text is drawn at final size on
     top so FreeType's own hinting and antialiasing survive.
 
-    The layout carries five facts -- the character, the state, the model, and the
-    two usage meters -- and nothing else. This is a keyboard strip read at arm's
-    length in whatever light the desk has, so the panel is worth more as five
-    things you can read in a glance than as nine things you have to lean in for.
-    Everything starts below DEAD_ZONE, which the device's own cutouts own.
+    Four things are on screen -- the character, the state, the model, and the two
+    usage meters -- and every one of them is set at CORE_SIZE, or as close to it
+    as 122 px of width allows. The readability note above the layout constants is
+    where those sizes come from; the short version is that this is a 22 mm-wide
+    strip read from 600 mm away, which fits about six legible characters a line.
     """
     from PIL import Image, ImageDraw
 
@@ -1061,73 +1111,69 @@ def render(status, now, config, phase=0.0):
     vector = ImageDraw.Draw(shapes)
     draw = ImageDraw.Draw(glyphs)
 
-    label_font = font(12, 700, rounded=False)
-    model_font = font(22, 700)
-    chip_font = font(11, 600, rounded=False)
-    pct_font = font(24, 800)
-    state_font = font(15, 800)
-    clock_font = font(15, 600, rounded=False)
-
     inner = width - 2 * PAD
+    cx = width / 2
     word, tint = STATE_STYLE[status.state]
+    core_cap = cap_box(draw, font(CORE_SIZE, 800))[1]
 
     # ------------------------------------------------------------------ mascot
     # MASCOT_REACH is how far the outermost glow ring gets from the centre, so
     # deriving the centre from it puts the character's first non-background pixel
-    # on MASCOT_TOP exactly -- which is what keeps it clear of the cutouts.
-    cx = width / 2
+    # on MASCOT_TOP exactly -- the check that keeps it clear of the cutouts. The
+    # size is set by width, not by taste: at 106 the ray tips clear both margins
+    # by 6 px and one more step would start shaving them off.
     radius = MASCOT_SIZE * MASCOT_REACH
     cy = MASCOT_TOP + radius
     draw_mascot(vector, cx * SS, cy * SS, MASCOT_SIZE * SS, status.state, phase)
     if status.state == "idle":
         # The one part of the character that is cheaper to set in type than to
         # draw from primitives, because it is literally a letter.
-        write(draw, cx + 28, cy - 48, "z", font(20, 700), (128, 138, 152))
-        write(draw, cx + 43, cy - 64, "z", font(14, 700), (110, 120, 134))
+        write(draw, cx + 27, cy - 45, "z", font(18, 700), (118, 128, 142))
+        write(draw, cx + 41, cy - 68, "z", font(26, 700), (132, 142, 156))
 
     # ------------------------------------------- state badge under the character
-    pill_w = min(inner, measure(draw, word, state_font) + STATE_TRACKING * (len(word) - 1) + 22)
-    pill_y = cy + radius + 14
+    state_font = font(CORE_SIZE, 800)
+    state_top, state_cap = cap_box(draw, state_font, "H")
+    pill_h = state_cap + 2 * PILL_PAD
+    pill_w = min(inner, measure(draw, word, state_font) + 2 * PILL_PAD + 6)
+    pill_y = cy + radius + GAP_MASCOT
     vector.rounded_rectangle(
-        [(cx - pill_w / 2) * SS, pill_y * SS, (cx + pill_w / 2) * SS, (pill_y + PILL_H) * SS],
-        radius=PILL_H / 2 * SS, fill=tint + (36,), outline=tint + (160,), width=SS,
+        [(cx - pill_w / 2) * SS, pill_y * SS, (cx + pill_w / 2) * SS, (pill_y + pill_h) * SS],
+        radius=pill_h / 2 * SS, fill=tint + (40,), outline=tint + (170,), width=SS,
     )
-    write(draw, cx, pill_y + 6, word, state_font, tint, align="center", spacing=STATE_TRACKING)
+    write(draw, cx, pill_y + PILL_PAD - state_top, word, state_font, tint, align="center")
 
     # ------------------------------------------------------------------- model
-    # The effort chip rides on the label row rather than beside the model name:
-    # at 22 px "Sonnet 5" alone is most of the panel's width, and the label row is
-    # empty on the right anyway.
-    cursor = pill_y + PILL_H + 16
-    write(draw, PAD, cursor, "MODEL", label_font, DIM, spacing=LABEL_SPACING)
-    if status.effort:
-        chip_w = measure(draw, status.effort, chip_font) + 14
-        chip_x = width - PAD - chip_w
-        vector.rounded_rectangle(
-            [chip_x * SS, (cursor - 2) * SS, (width - PAD) * SS, (cursor + 16) * SS],
-            radius=9 * SS, fill=CLAY_DEEP + (70,), outline=CLAY_DEEP + (200,), width=SS,
-        )
-        write(draw, chip_x + 7, cursor + 1, status.effort, chip_font, CLAY)
-    cursor += 15
-    write(draw, PAD, cursor, status.model or "--", model_font,
+    # Sized per frame: "Opus 5" clears the 22 arcmin target outright, "Haiku 4.5"
+    # is three characters longer than the panel can carry at that size and gets
+    # the biggest type it can instead of dragging every other name down with it.
+    # The slot advances by core_cap either way, so the rows below never move.
+    cursor = pill_y + pill_h + GAP_SECTION
+    name = status.model or "--"
+    name_font = fit(draw, name, inner, MODEL_SIZES, weight=700)
+    write(draw, PAD, cursor - cap_box(draw, name_font)[0], name, name_font,
           INK if status.model else DIM, max_width=inner)
-    cursor += 26
+    cursor += core_cap
 
     # ------------------------------------------------------------------- usage
-    # Percentage and bar only. A window's reset time is the one usage fact that
-    # cannot be set large enough to read here, so it lives in `--status` instead
-    # of stealing a row from the two that can.
-    for label, data in (("5 HR", status.five_hour), ("WEEK", status.seven_day)):
-        cursor += 16
+    # "5H 100%" is 145 px at CORE_SIZE and the panel has 122, so the per-cent sign
+    # went rather than the type size -- a number sitting on top of a meter does not
+    # need one. Labels are two characters for the same reason.
+    label_font = font(CORE_SIZE, 700)
+    label_top = cap_box(draw, label_font)[0]
+    value_font = font(CORE_SIZE, 800)
+    value_top = cap_box(draw, value_font)[0]
+    for label, data in (("5H", status.five_hour), ("7D", status.seven_day)):
+        cursor += GAP_SECTION
         if data is None:
-            pct, colour, text = 0.0, FAINT, "--"
+            pct, colour, reading = 0.0, FAINT, "--"
         else:
             pct = max(0.0, min(100.0, data["used_percentage"]))
             colour = usage_color(pct)
-            text = f"{pct:.0f}%"
-        write(draw, PAD, cursor, label, label_font, DIM, spacing=LABEL_SPACING)
-        write(draw, width - PAD, cursor - 6, text, pct_font, colour, align="right")
-        bar_y = cursor + 26
+            reading = f"{pct:.0f}"
+        write(draw, PAD, cursor - label_top, label, label_font, DIM)
+        write(draw, width - PAD, cursor - value_top, reading, value_font, colour, align="right")
+        bar_y = cursor + core_cap + GAP_BAR
         vector.rounded_rectangle(
             [PAD * SS, bar_y * SS, (width - PAD) * SS, (bar_y + BAR_H) * SS],
             radius=BAR_H / 2 * SS, fill=FAINT + (255,))
@@ -1138,20 +1184,7 @@ def render(status, now, config, phase=0.0):
                 radius=BAR_H / 2 * SS, fill=colour + (255,))
         cursor = bar_y + BAR_H
 
-    # ------------------------------------------------------------------ footer
-    # Clock and a reachability dot. The "how long since Claude last did anything"
-    # stamp that used to sit here was 9 px of the least glanceable fact on the
-    # panel -- the character already says whether anything is happening.
-    footer_top = height - FOOTER_H
-    vector.rectangle(
-        [PAD * SS, footer_top * SS, (width - PAD) * SS, footer_top * SS + SS], fill=RULE + (255,))
-    write(draw, PAD, footer_top + 7, time.strftime("%H:%M", time.localtime(now)), clock_font, DIM)
-    dot = CLAY if status.online else FAINT
-    vector.ellipse(
-        [(width - PAD - 9) * SS, (footer_top + 12) * SS,
-         (width - PAD) * SS, (footer_top + 21) * SS], fill=dot + (255,))
-
-    # Shapes first, then type, so the pill outlines and bars sit *behind* their
+    # Shapes first, then type, so the pill outline and the bars sit *behind* their
     # labels no matter what order the layout drew them in.
     flattened = shapes.resize((width, height), Image.LANCZOS)
     base.paste(flattened, (0, 0), flattened)
