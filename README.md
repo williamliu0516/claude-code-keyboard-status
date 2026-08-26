@@ -142,6 +142,11 @@ coordinate is derived from `MASCOT_TOP` below it, and `docs/make_preview.py` fai
 the build if any state puts a single non-background pixel above the line. That
 leaves **358 usable rows**, which is the budget the layout is solved against.
 
+40 is measured, not assumed: `--testcard`'s top band is an 8 px ladder with the
+step above the line in red and the step below it in green. On the panel the red is
+invisible and the green is not, so the line is in the right place — if anything a
+row or two conservative, which is the direction to be wrong in.
+
 ### What is deliberately missing
 
 The project name, the git branch, the session title, the reset countdowns, the
@@ -183,11 +188,23 @@ used to throw three twinkles onto a wide orbit while working; they were ~9 arcmi
 what capped the character's size, because it clipped both margins first. Dropping
 them bought 6 px of bloom, which you can actually see.
 
-## Is it actually point-to-point?
+## Is it actually point-to-point? — yes
 
-The rendered frame is exactly 142×428 with no resampling anywhere in our pipeline,
-so a soft-looking panel has three possible causes, and guessing between them is
-pointless. `--testcard` settles it:
+**Tested on the glass, and the answer is yes.** The 1 px checkerboard, both 1 px
+gratings and every block size come up crisp on the panel, so the device is *not*
+resampling 142×428 to some other native grid, and the display is not the limiting
+factor. The 8 px ladder confirmed `DEAD_ZONE` too: the red band above the 40 px
+line is invisible, the green one below it is not.
+
+What was read as "blurry" was type below the readability threshold — the same
+observation as *"bigger text is clearer"*, which is what a 15 arcmin glyph looks
+like next to a 22 arcmin one, not what a soft panel looks like. That is fixed by
+[sizing from the physics](#how-the-sizes-were-chosen), not by a sharpening pass.
+
+The card is kept because it is how that got settled, and because it catches the
+opposite failure too — see [the antialiasing A/B](#the-antialiasing-ab).
+
+`--testcard` renders it:
 
 ```sh
 keyboard_status.py --testcard              # POST it to the panel
@@ -206,7 +223,7 @@ Geometry only — no state, no layout, and no fonts on the fine bands:
 | 192–256 | 2 px and 4 px vertical lines | if even 4 px is soft, it is the panel itself |
 | 256–304 | 16 px hard-edged blocks | **the control.** Nothing in our pipeline can blur an edge this coarse |
 | 304–390 | text at 34 / 28 / 22, native size | compare against the blocks |
-| 390–428 | a disc and a diagonal | the only things that *should* have grey edge pixels |
+| 390–428 | **antialiasing A/B**, split by a hairline at x=70 | left pair smooth, right pair stepped = working |
 
 ### What was ruled out on this side, with numbers
 
@@ -239,10 +256,46 @@ Two of the three suspects are therefore dead:
   of a letter at this size are FreeType antialiasing, and removing them would make
   22 px type look worse, not sharper.
 
-Which leaves the third: if the fine bands read as flat grey while the 16 px blocks
-are crisp, the device is resampling 142×428 to some other native panel resolution,
-and nothing on this side reaches that. See
-[known limitations](#known-limitations).
+And the third suspect — device-side rescaling — is the one the card was built to
+catch, and it came back clean.
+
+### The antialiasing A/B
+
+Softness and jaggedness are opposite failures that both read as "wrong" from a
+foot away, so the last band tests for the other one. Left disc and diagonal go
+through the supersampled vector layer that draws every curve in the real layout;
+right disc and diagonal are the same radius, slope and stroke width drawn straight
+onto the native canvas with `ImageDraw`, which does not antialias at all.
+
+| | Distinct grey levels on the edge |
+| --- | --- |
+| left — vector layer | **99** |
+| right — native `ImageDraw` | **2** (`0` and `255`) |
+
+So left smooth and right stepped means antialiasing is reaching the glass; both
+stepped means it is not.
+
+The first version of this card got that wrong in a way worth recording: it drew
+*both* shapes the native way while describing them as coming off the vector layer.
+They were therefore genuinely aliased — 2 grey levels, hard steps — the jaggedness
+was real, and it was in the diagnostic rather than in the layout. One round of
+investigation went looking for a rendering bug that was in the test.
+
+Measuring the real layout instead: the character's edges carry **152 distinct
+levels** with a one-to-two pixel ramp. Nothing was wrong there. But the check did
+turn up a knob that was set too low, so it got measured properly rather than
+guessed at:
+
+| `SS` | Edge grey levels | Worst pixel vs previous | Median render |
+| --- | --- | --- | --- |
+| 4 | 223 | — | 7.7 ms |
+| 6 | 243 | 60 / 255 | 11.4 ms |
+| **8** | **249** | 28 / 255 | 15.7 ms |
+| 12 | 247 | 20 / 255 | 32.9 ms |
+
+`SS` is now **8**. Twelve buys nothing — the level count goes *down*, which is
+LANCZOS noise — and doubles the cost, so 8 is where it stops paying. 15.7 ms and a
+15.6 MB transient layer against a 5-second tick is not a trade worth thinking about.
 
 ## Why a daemon *and* hooks
 
@@ -355,7 +408,7 @@ mostly useful for one-off runs.
 | `--daemon` | run the push loop in the foreground (what launchd runs) |
 | `--once` | render and push a single frame; exits non-zero if the push failed |
 | `--preview out.png [state]` | render to a file without pushing; force a pose to see it |
-| `--testcard [PATH]` | the resolution card: POST it, or write it to `PATH` |
+| `--testcard [PATH]` | the resolution + antialiasing card: POST it, or write it to `PATH` |
 | `--status` | dump the resolved status as JSON — the first stop when debugging |
 
 Logs go to `~/.claude/keyboard-status.log`.
@@ -391,13 +444,6 @@ layout looks the way it does.
 - **One session on screen at a time.** With several sessions running, the panel
   follows whichever moved most recently, and does not say which one it picked —
   `--status` does. There is no room on 142 px to do better.
-- **The panel may be resampling us, and we would not know.** 142×428 is the size
-  the upload API accepts; whether it is the glass's native grid is not something
-  the device reports. Our side is verifiably point-to-point — see
-  [is it actually point-to-point?](#is-it-actually-point-to-point) for the
-  per-band numbers — so if `--testcard`'s 1 px bands come up as flat grey while its
-  16 px blocks are crisp, the resampling is happening downstream of the POST and
-  there is no setting on this side that reaches it. Nothing to do but know it.
 - **No authentication, no TLS.** The device offers neither, so the daemon assumes a
   LAN it trusts. Do not expose that endpoint to a network you do not control.
 - **A sleeping panel drops frames.** Some of these keyboards power the display down

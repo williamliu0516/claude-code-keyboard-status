@@ -769,7 +769,12 @@ STATE_STYLE = {
 # ImageDraw does not antialias anything, and a jagged mascot on a 142 px panel is
 # immediately obvious. Drawing the shapes 4x and resampling down fixes it for the
 # cost of one 568x1712 RGBA buffer per frame.
-SS = 4
+# Supersampling factor for the vector layer. Measured, because the obvious knob is
+# not always the one that is stuck: stepping 4 -> 6 -> 8 -> 12 moves the number of
+# distinct edge grey levels 223 -> 243 -> 249 -> 247 and the worst-case pixel by
+# 60 -> 28 -> 20 of 255, so 8 is where it stops paying. Render goes 7.7 ms -> 15.7 ms
+# and the transient layer 3.9 MB -> 15.6 MB, which is nothing against a 5 s tick.
+SS = 8
 
 FONT_ROUNDED = "/System/Library/Fonts/SFNSRounded.ttf"
 FONT_TEXT = "/System/Library/Fonts/SFNS.ttf"
@@ -1246,10 +1251,20 @@ def testcard(config):
       256-304 16 px hard-edged blocks -- JPEG-safe control. Soft here = device, full
               stop, because nothing in our pipeline can blur an edge this coarse.
       304-390 text at 34 / 28 / 22, drawn at native size with no supersampling
-      390-428 a disc and a diagonal -- the only things on the card that are
-              *supposed* to have grey edge pixels, since curves come off the 4x
-              vector layer. Compare them with the blocks above: if the blocks are
-              crisp and these are smooth, that is antialiasing working, not blur.
+      390-428 an A/B on antialiasing, split by a hairline at x=70. Left disc and
+              diagonal go through the same supersampled vector layer the character
+              and the meters use. Right disc and diagonal are drawn straight onto
+              the native canvas with ImageDraw, which does not antialias at all --
+              that is the control, and it is *meant* to look stepped. Same radius,
+              same slope, same stroke width, so the only difference is the path.
+              Left smooth and right stepped means our antialiasing reaches the
+              glass. Both stepped means it does not. Both smooth means the panel
+              is softening everything, which the gratings above would already have
+              shown.
+
+    An earlier version of this card drew both shapes the native way and described
+    them as coming off the vector layer, which is exactly backwards and sent one
+    round of diagnosis down the wrong path. Hence the A/B.
     """
     from PIL import Image, ImageDraw
 
@@ -1282,9 +1297,19 @@ def testcard(config):
         write(draw, PAD, y, "Opus 8", font(size, 700), (255, 255, 255))
         y += cap_box(draw, font(size, 700))[1] + 8
 
-    # Curves, which are the one thing that legitimately arrives antialiased.
-    draw.ellipse([PAD, 392, PAD + 32, 424], fill=(255, 255, 255))
-    draw.line([(PAD + 44, 424), (width - PAD, 392)], fill=(255, 255, 255), width=2)
+    # Left: through the vector layer, the way every curve in the real layout is
+    # drawn. Same geometry on the right, drawn natively as the aliased control.
+    shapes = Image.new("RGBA", (width * SS, height * SS), (0, 0, 0, 0))
+    vector = ImageDraw.Draw(shapes)
+    white = (255, 255, 255, 255)
+    disc(vector, 21 * SS, 409 * SS, 13 * SS, white)
+    capsule(vector, (38 * SS, 422 * SS), (64 * SS, 396 * SS), 1.5 * SS, 1.5 * SS, white)
+    flattened = shapes.resize((width, height), Image.LANCZOS)
+    card.paste(flattened, (0, 0), flattened)
+
+    draw.line([(70, 392), (70, 426)], fill=(80, 80, 80), width=1)
+    draw.ellipse([78, 396, 104, 422], fill=(255, 255, 255))
+    draw.line([(108, 422), (134, 396)], fill=(255, 255, 255), width=3)
     return card
 
 
