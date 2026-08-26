@@ -1360,3 +1360,307 @@ def run_daemon(config, once=False):
             return 0 if online else 1
         elapsed = time.time() - started
         time.sleep(max(0.5, config["tick_seconds"] - elapsed))
+
+
+# ---------------------------------------------------------------------- installer
+
+HOOK_MARKER = "keyboard-status.py"      # how we recognise our own hook entries
+HOOK_TIMEOUT = 5
+
+
+def venv_python():
+    return os.path.join(VENV_PATH, "bin", "python3")
+
+
+def ensure_venv():
+    """A private virtualenv with Pillow in it, at ~/.claude/keyboard-status-venv.
+
+    Pillow is the one thing this needs that claude-status-bar did not, and there
+    is no polite way to install it into a system Python on a modern macOS (PEP 668
+    marks it externally managed, and rightly). A venv beside the script keeps the
+    dependency entirely inside ~/.claude, so uninstalling is `rm -rf`.
+    """
+    import subprocess
+
+    python = venv_python()
+    if not os.path.exists(python):
+        print(f"creating virtualenv at {VENV_PATH}")
+        subprocess.run([sys.executable, "-m", "venv", VENV_PATH], check=True)
+    probe = subprocess.run([python, "-c", "import PIL"], capture_output=True)
+    if probe.returncode != 0:
+        print("installing Pillow")
+        subprocess.run([python, "-m", "pip", "install", "--quiet", "--upgrade", "pip"], check=False)
+        subprocess.run([python, "-m", "pip", "install", "--quiet", "Pillow"], check=True)
+    return python
+
+
+def write_plist(python):
+    """A launchd agent that starts at login and is restarted if it ever dies."""
+    import plistlib
+
+    os.makedirs(os.path.dirname(LAUNCH_PLIST), exist_ok=True)
+    agent = {
+        "Label": LAUNCH_LABEL,
+        "ProgramArguments": [python, INSTALL_PATH, "--daemon"],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        # Without this a crash-on-start loops as fast as launchd can fork.
+        "ThrottleInterval": 15,
+        "StandardOutPath": LOG_PATH,
+        "StandardErrorPath": LOG_PATH,
+        # Tells the scheduler this is not interactive, so it yields to real work.
+        "ProcessType": "Background",
+    }
+    with open(LAUNCH_PLIST, "wb") as handle:
+        plistlib.dump(agent, handle)
+    return LAUNCH_PLIST
+
+
+def launchctl(*args, quiet=True):
+    import subprocess
+
+    try:
+        result = subprocess.run(["launchctl", *args], capture_output=True, text=True)
+        if result.returncode != 0 and not quiet:
+            sys.stderr.write(result.stderr)
+        return result.returncode == 0
+    except OSError:
+        return False
+
+
+def reload_agent():
+    domain = f"gui/{os.getuid()}"
+    launchctl("bootout", f"{domain}/{LAUNCH_LABEL}")          # ignore "not loaded"
+    if not launchctl("bootstrap", domain, LAUNCH_PLIST, quiet=False):
+        # Older macOS, or a domain that refuses bootstrap: the legacy verbs still work.
+        launchctl("unload", LAUNCH_PLIST)
+        launchctl("load", "-w", LAUNCH_PLIST, quiet=False)
+
+
+def merge_hooks(settings, command):
+    """Add our hook to each event, leaving every other hook exactly as it was.
+
+    settings.json is the user's file and routinely holds hooks from other tools.
+    Each event maps to a list of matcher groups, each holding a list of commands,
+    so the safe edit is: find the group that already contains *our* command and
+    update it in place, otherwise append one group of our own. Re-running install
+    must not accumulate duplicates, which is what the marker search is for.
+    """
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+    entry = {"type": "command", "command": command, "timeout": HOOK_TIMEOUT}
+    for event in HOOK_EVENTS:
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            groups = []
+        replaced = False
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                continue
+            for index, existing in enumerate(group["hooks"]):
+                if isinstance(existing, dict) and HOOK_MARKER in str(existing.get("command", "")):
+                    group["hooks"][index] = entry
+                    replaced = True
+        if not replaced:
+            groups.append({"hooks": [entry]})
+        hooks[event] = groups
+    settings["hooks"] = hooks
+    return settings
+
+
+def strip_hooks(settings):
+    """Remove only our hook entries, and only empty groups we left behind."""
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return settings
+    for event in list(hooks):
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            continue
+        kept = []
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                kept.append(group)
+                continue
+            group["hooks"] = [
+                item for item in group["hooks"]
+                if not (isinstance(item, dict) and HOOK_MARKER in str(item.get("command", "")))
+            ]
+            # Only drop the group if it is now empty *and* carries nothing else,
+            # so a matcher someone configured by hand is never silently discarded.
+            if group["hooks"] or set(group) - {"hooks"}:
+                kept.append(group)
+        if kept:
+            hooks[event] = kept
+        else:
+            hooks.pop(event)
+    if hooks:
+        settings["hooks"] = hooks
+    else:
+        settings.pop("hooks", None)
+    return settings
+
+
+def save_settings(settings):
+    with open(SETTINGS_PATH, "w") as handle:
+        json.dump(settings, handle, indent=2)
+        handle.write("\n")
+
+
+def load_settings_for_edit():
+    """settings.json, with a backup taken first if it is present but unreadable."""
+    settings = read_json(SETTINGS_PATH)
+    if os.path.exists(SETTINGS_PATH) and not settings:
+        # Unreadable rather than absent. Overwriting would silently drop every
+        # other setting, so keep a copy of whatever is there before replacing it.
+        backup = f"{SETTINGS_PATH}.bak"
+        os.replace(SETTINGS_PATH, backup)
+        print(f"settings.json was unreadable; kept a copy at {backup}")
+    return settings
+
+
+def install(with_hooks=True):
+    os.makedirs(CLAUDE_DIR, exist_ok=True)
+
+    source = os.path.abspath(__file__)
+    if source != INSTALL_PATH:
+        with open(source) as src, open(INSTALL_PATH, "w") as dst:
+            dst.write(src.read())
+        os.chmod(INSTALL_PATH, 0o755)
+        print(f"installed {INSTALL_PATH}")
+
+    if not os.path.exists(CONFIG_PATH):
+        write_json_atomic(CONFIG_PATH, {"url": DEFAULTS["url"]})
+        print(f"wrote {CONFIG_PATH} (edit it to change the keyboard address)")
+
+    python = ensure_venv()
+    write_plist(python)
+    reload_agent()
+    print(f"loaded launchd agent {LAUNCH_LABEL}")
+
+    if with_hooks:
+        settings = merge_hooks(load_settings_for_edit(), f"python3 {INSTALL_PATH} --hook")
+        save_settings(settings)
+        print(f"registered {len(HOOK_EVENTS)} hooks in {SETTINGS_PATH}")
+        print("open a new session (or restart an existing one) for the hooks to load")
+    else:
+        print("skipped hook registration (--no-hooks); the daemon still works, but it")
+        print("cannot tell a permission prompt from ongoing work")
+
+    print(f"logs: {LOG_PATH}")
+
+
+def uninstall():
+    launchctl("bootout", f"gui/{os.getuid()}/{LAUNCH_LABEL}")
+    launchctl("unload", LAUNCH_PLIST)
+    for path in (LAUNCH_PLIST, INSTALL_PATH, STATE_PATH):
+        try:
+            os.unlink(path)
+            print(f"removed {path}")
+        except OSError:
+            pass
+    import shutil
+
+    if os.path.isdir(VENV_PATH):
+        shutil.rmtree(VENV_PATH, ignore_errors=True)
+        print(f"removed {VENV_PATH}")
+
+    if os.path.exists(SETTINGS_PATH):
+        save_settings(strip_hooks(load_settings_for_edit()))
+        print(f"removed hooks from {SETTINGS_PATH}")
+    # ~/.claude/keyboard-status.json is yours; statusline-usage.json belongs to
+    # claude-status-bar. Neither is ours to delete.
+    print(f"left {CONFIG_PATH} in place")
+
+
+# ------------------------------------------------------------------------- entries
+
+
+def hook_main(config):
+    """The in-session entry point. Fast, silent, and incapable of failing loudly.
+
+    Claude Code treats a non-zero exit from most hooks as something worth telling
+    the user about, and a hook that writes to stdout can perturb the session, so
+    this swallows everything and always exits 0. The worst possible outcome is a
+    keyboard that shows a slightly stale state for a few seconds.
+    """
+    try:
+        payload = json.load(sys.stdin)
+        if isinstance(payload, dict):
+            record_hook_event(payload, time.time(), config["session_ttl_seconds"])
+    except Exception:  # noqa: BLE001 - deliberate: never disturb the session
+        pass
+    return 0
+
+
+def preview(config, path, state=None):
+    """Render one frame to a file and push nothing. For design work and for docs."""
+    now = time.time()
+    status = collect(now, config, allow_poll=False)
+    if state:
+        status.state = state
+    image = render(status, now, config, phase=1.0)
+    if path.lower().endswith((".jpg", ".jpeg")):
+        with open(path, "wb") as handle:
+            handle.write(encode(image, config))
+    else:
+        image.save(path)
+    print(f"wrote {path} ({status.state}, {image.width}x{image.height})")
+    return 0
+
+
+def show_status(config):
+    """Everything the renderer would see, as JSON. The first stop when debugging."""
+    now = time.time()
+    status = collect(now, config, allow_poll=False)
+    print(json.dumps({
+        key: value for key, value in vars(status).items()
+    }, indent=2, default=str))
+    return 0
+
+
+USAGE = """usage: keyboard_status.py [command]
+
+  --install [--no-hooks]  install to ~/.claude, create the venv, load the launchd
+                          agent, and register the session hooks
+  --uninstall             undo all of that
+  --daemon                run the push loop in the foreground (what launchd runs)
+  --once                  render and push a single frame, then exit
+  --preview PATH [STATE]  render to PATH (.png or .jpg) without pushing; STATE is
+                          one of working/waiting/idle/offline to force a pose
+  --status                dump the resolved status as JSON
+  --hook                  read a hook payload on stdin and record it (internal)
+"""
+
+
+def main(argv):
+    config = load_config()
+    command = argv[1] if len(argv) > 1 else "--help"
+
+    if command == "--hook":
+        return hook_main(config)
+    if command == "--install":
+        install(with_hooks="--no-hooks" not in argv)
+        return 0
+    if command == "--uninstall":
+        uninstall()
+        return 0
+    if command == "--daemon":
+        log(f"starting: {config['url']} every {config['tick_seconds']:g}s")
+        return run_daemon(config)
+    if command == "--once":
+        return run_daemon(config, once=True)
+    if command == "--preview":
+        if len(argv) < 3:
+            sys.stderr.write("--preview needs an output path\n")
+            return 2
+        return preview(config, argv[2], argv[3] if len(argv) > 3 else None)
+    if command == "--status":
+        return show_status(config)
+    sys.stdout.write(USAGE)
+    return 0 if command in ("--help", "-h") else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
