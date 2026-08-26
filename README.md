@@ -1,14 +1,19 @@
 # claude-code-keyboard-status
 
 Live [Claude Code](https://claude.com/claude-code) state on the 142×428 image
-display of a mechanical keyboard: what Claude is doing right now, which project and
-branch, which model, and how much of your 5-hour and weekly budget is gone.
+display of a mechanical keyboard: what Claude is doing right now, which model is
+answering, and how much of your 5-hour and weekly budget is gone.
 
 ![the four states](docs/states.png)
 
-The character on top is the whole point. From across a desk you cannot read 9-point
-type, but you can tell a spinning orange bloom from a sleeping one — and the yellow
-badge means Claude is blocked on a permission prompt and has been waiting for you.
+The character on top is the whole point. From across a desk you cannot read a
+project name, but you can tell a spinning orange bloom from a sleeping one — and the
+yellow badge means Claude is blocked on a permission prompt and has been waiting
+for you.
+
+The panel carries five facts and no more. It is read at arm's length, at a glance,
+in whatever light the desk has, so everything on it is set large enough to survive
+that — which leaves room for five things, not nine.
 
 ## Install
 
@@ -53,20 +58,42 @@ Your `keyboard-status.json` is left alone, and so is
 
 ## What it shows
 
-| Cell | Notes |
-| --- | --- |
-| character | the session state, as a pose — see the table below |
-| state pill | the same thing in words, for when you are close enough to read it |
-| project | basename of the active session's working directory |
-| branch | current branch, `@a1b2c3d` when HEAD is detached, hidden outside a repo |
-| model | `Opus 5`, `Sonnet 5`, … resolved from the session transcript |
-| effort | the effort chip beside the model, when one is set |
-| `5 HOUR` | 5-hour usage window: bar, percentage, time until reset |
-| `WEEK` | weekly usage window, same |
-| `DOING` | the session title Claude Code writes for the conversation, or the first of your prompt if it has not written one yet |
-| footer | render clock, and how long ago the session last moved |
+| Cell | Size | Notes |
+| --- | --- | --- |
+| character | 100 px | the session state, as a pose — see the table below |
+| state badge | 15 px | the same thing in words, for when you are close enough to read it |
+| `MODEL` | 22 px | `Opus 5`, `Sonnet 5`, … resolved from the session transcript |
+| effort chip | 11 px | rides on the `MODEL` label row, when an effort is set |
+| `5 HR` | 24 px + 15 px bar | 5-hour usage window: percentage and meter |
+| `WEEK` | 24 px + 15 px bar | weekly usage window, same |
+| footer | 15 px | render clock, and a dot for whether the last POST landed |
 
 Bars are green below 50%, amber to 75%, orange to 90%, red above.
+
+### The top 40 rows are not yours
+
+The physical panel sits behind the device's own cutouts, so the first 40 rows are
+covered — not dim, not cropped, gone. `DEAD_ZONE` records that, every vertical
+coordinate is derived from `MASCOT_TOP` below it, and the preview script asserts no
+frame puts a single non-background pixel above the line. That leaves 358 usable
+rows, which is the constraint the whole layout is solved against.
+
+### What is deliberately missing
+
+The project name, the git branch, the session title and the reset countdowns used to
+be here, at 9–10 px. They are gone, and the space went into type you can actually
+read at arm's length. Each was a fair trade:
+
+- **project and branch** — you know which repo you are in; the terminal in front of
+  you says so.
+- **session title / prompt** — a wrapped sentence is the one thing on a 142 px panel
+  that can never be glanceable. Reading it means leaning in, and if you are leaning
+  in you may as well look at the terminal.
+- **reset countdowns** — the least urgent usage fact, and the one that costs a whole
+  row per meter. `--status` still prints them.
+- **"last activity" stamp** — the character already answers that question.
+
+All of it is still collected; `--status` dumps everything the renderer could see.
 
 ## The four states
 
@@ -84,11 +111,10 @@ alive" legible without reading anything. In every other state it holds still.
 
 Neither half can do this job alone, and the split falls along the grain of the data.
 
-**A hook-only design goes stale the moment you stop typing.** Two of the things on
-screen — the 5-hour and weekly reset countdowns — move on wall-clock time, not on
-anything a session does. A display that only redraws on session events freezes at
-whatever it last saw and then quietly lies for hours, which is worse than showing
-nothing.
+**A hook-only design goes stale the moment you stop typing.** The clock and both
+usage meters move on wall-clock time, not on anything a session does. A display that
+only redraws on session events freezes at whatever it last saw and then quietly lies
+for hours, which is worse than showing nothing.
 
 **A daemon-only design cannot see state.** Whether Claude is thinking, waiting for
 you to approve a tool call, or finished, is delivered to hook commands and written
@@ -166,7 +192,11 @@ response cannot stall the display.
 | `active_seconds` | `45` | transcript movement newer than this counts as working |
 | `session_ttl_seconds` | `21600` | after this, a session stops being the current one |
 | `usage_poll_seconds` | `60` | shared with claude-status-bar's own throttle |
-| `show_task_title` | `true` | set false to drop the `DOING` cell |
+
+Layout constants (`DEAD_ZONE`, `MASCOT_TOP`, `MASCOT_SIZE`, `PILL_H`, `BAR_H`,
+`FOOTER_H`) sit at the top of the drawing section in `keyboard_status.py`. They are
+code rather than config because they only make sense together: change one and the
+vertical budget has to be re-solved.
 
 `CLAUDE_KEYBOARD_URL`, `CLAUDE_KEYBOARD_TICK`, `CLAUDE_KEYBOARD_HEARTBEAT`,
 `CLAUDE_KEYBOARD_TIMEOUT` and `CLAUDE_KEYBOARD_QUALITY` override the file, which is
@@ -196,8 +226,12 @@ curl -X POST --data-binary @image.jpg -H 'Content-Type: image/jpeg' \
 
 It takes **baseline** JPEG only, at most 512 KB. Pillow writes baseline unless you
 ask for progressive, so `encode` simply never passes `progressive`; at 142×428 a
-frame is about 17 KB, and the quality-reduction loop guarding the ceiling is there
+frame is about 15 KB, and the quality-reduction loop guarding the ceiling is there
 for a bigger future panel rather than for this one.
+
+The top 40 rows of that panel are behind the device's own cutouts — see
+[the top 40 rows are not yours](#the-top-40-rows-are-not-yours). If your keyboard's
+dead zone is a different height, change `DEAD_ZONE` and `MASCOT_TOP` together.
 
 ## Known limitations
 
@@ -205,15 +239,13 @@ for a bigger future panel rather than for this one.
   anywhere; only `--install`'s launchd agent is Apple-specific. On Linux, write a
   systemd user unit that runs `keyboard_status.py --daemon`.
 - **One session on screen at a time.** With several sessions running, the panel
-  follows whichever moved most recently. There is no room on 142 px to do better.
+  follows whichever moved most recently, and does not say which one it picked —
+  `--status` does. There is no room on 142 px to do better.
 - **No authentication, no TLS.** The device offers neither, so the daemon assumes a
   LAN it trusts. Do not expose that endpoint to a network you do not control.
 - **A sleeping panel drops frames.** Some of these keyboards power the display down
   and stop answering; the daemon keeps retrying at up to a minute apart, and the
   panel keeps showing the last frame that landed. Nothing is queued.
-- **`DOING` starts as your prompt.** Claude Code writes the conversation title a
-  little way into a session, so until it does, that cell shows the beginning of the
-  prompt instead.
 - **Concurrent hooks can lose an event.** Two sessions writing the state file at the
   same instant race on read-modify-write; the loser's event is dropped and the next
   tick re-resolves from the transcript anyway.

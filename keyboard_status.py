@@ -103,7 +103,6 @@ DEFAULTS = {
     # Sessions quieter than this stop being "the current session" at all.
     "session_ttl_seconds": 6 * 3600.0,
     "usage_poll_seconds": 60.0,
-    "show_task_title": True,
 }
 
 ENV_OVERRIDES = {
@@ -692,8 +691,9 @@ def collect(now, config, allow_poll=True, blocking=False):
     if facts:
         status.model = short_model(facts.model)
         status.effort = facts.effort
-        if config["show_task_title"]:
-            status.title = facts.title or facts.last_prompt
+        # Not drawn any more; kept because `--status` is where you go to find
+        # out which session the panel actually latched onto.
+        status.title = facts.title or facts.last_prompt
 
     status.state = resolve_state(hook, transcripts.get(session), now, config)
     if status.state == "waiting":
@@ -893,58 +893,6 @@ def elide(draw, text, fonts, max_width):
     return "…"
 
 
-def wrap(draw, text, fonts, max_width, max_lines):
-    """Greedy wrap that breaks on spaces for latin and anywhere for CJK.
-
-    Session titles come back in whatever language the prompt was written in, and
-    Chinese has no spaces to break on -- a space-only wrapper emits one line the
-    width of the panel and drops the rest.
-    """
-    lines, line, last_break = [], "", -1
-    for char in text:
-        if char == "\n":
-            lines.append(line)
-            line, last_break = "", -1
-            if len(lines) >= max_lines:
-                break
-            continue
-        candidate = line + char
-        if measure(draw, candidate, fonts) <= max_width:
-            line = candidate
-            if char == " ":
-                last_break = len(line)
-            elif _is_wide(char):
-                last_break = len(line)
-            continue
-        if last_break > 0 and not _is_wide(char):
-            lines.append(line[:last_break].rstrip())
-            line = line[last_break:] + char
-        else:
-            lines.append(line)
-            line = char
-        last_break = -1
-        if len(lines) >= max_lines:
-            line = ""
-            break
-    if line and len(lines) < max_lines:
-        lines.append(line)
-    if not lines:
-        return []
-    # The overflow marker goes on the last line we kept, replacing its tail.
-    consumed = sum(len(item) for item in lines)
-    if consumed < len(text.replace("\n", "")):
-        lines[-1] = elide(draw, lines[-1] + "…", fonts, max_width)
-    return lines[:max_lines]
-
-
-# -------------------------------------------------------------------------- mascot
-#
-# An original character, drawn entirely from primitives -- no trademarked artwork,
-# no image assets to ship. A rounded nine-ray bloom in Claude's clay orange with a
-# face on its core, which is enough personality to read the session state from
-# across a desk, and cheap enough to redraw every few seconds.
-
-
 def capsule(draw, p0, p1, r0, r1, fill):
     """A tapered round-ended bar from `p0` (radius r0) to `p1` (radius r1)."""
     import math
@@ -1067,6 +1015,18 @@ def draw_mascot(draw, cx, cy, size, state, phase):
 
 PAD = 10                     # side margin; everything lives inside it
 LABEL_SPACING = 1.2          # tracking for the small uppercase section labels
+STATE_TRACKING = 1.0         # the state badge is set larger, so it needs less
+
+# The top of the physical panel sits behind the device's own cutouts, so the
+# first 40 rows are unusable -- not dim, not cropped, covered. Every coordinate
+# below is derived from MASCOT_TOP so nothing can drift back up into them.
+DEAD_ZONE = 40
+MASCOT_TOP = 44              # first row the character is allowed to touch
+MASCOT_SIZE = 100            # its outermost glow reaches MASCOT_REACH * this
+MASCOT_REACH = 0.63          # matches the last ring draw_mascot paints
+PILL_H = 28                  # state badge
+BAR_H = 15                   # usage meter
+FOOTER_H = 30                # rule, clock and reachability dot
 
 
 def usage_color(pct):
@@ -1079,29 +1039,18 @@ def usage_color(pct):
     return GOOD
 
 
-def countdown(resets_at, now):
-    """Compact time until a window resets: `3d4h`, `2h13m`, `47m`."""
-    remaining = int(resets_at - now)
-    if remaining <= 0:
-        return "now"
-    days, remaining = divmod(remaining, 86400)
-    hours, remaining = divmod(remaining, 3600)
-    minutes = remaining // 60
-    if days:
-        return f"{days}d {hours}h"
-    if hours:
-        return f"{hours}h {minutes:02d}m"
-    return f"{minutes}m"
-
-
 def render(status, now, config, phase=0.0):
     """Compose one frame. Returns an RGB `Image` of exactly width x height.
 
     Two passes over two surfaces: every vector shape goes onto a 4x RGBA layer
     that is resampled down for antialiasing, then text is drawn at final size on
-    top so FreeType's own hinting and antialiasing survive. Drawing text into the
-    supersampled layer instead would soften it noticeably at 9-11 px, which is
-    most of the type on a panel this small.
+    top so FreeType's own hinting and antialiasing survive.
+
+    The layout carries five facts -- the character, the state, the model, and the
+    two usage meters -- and nothing else. This is a keyboard strip read at arm's
+    length in whatever light the desk has, so the panel is worth more as five
+    things you can read in a glance than as nine things you have to lean in for.
+    Everything starts below DEAD_ZONE, which the device's own cutouts own.
     """
     from PIL import Image, ImageDraw
 
@@ -1112,139 +1061,95 @@ def render(status, now, config, phase=0.0):
     vector = ImageDraw.Draw(shapes)
     draw = ImageDraw.Draw(glyphs)
 
-    label_font = font(9, 600, rounded=False)
-    value_font = font(15, 620)
-    big_font = font(17, 700)
-    small_font = font(10, 400, rounded=False)
-    tiny_font = font(9, 400, rounded=False)
-    pct_font = font(14, 700)
-    state_font = font(10, 700)
+    label_font = font(12, 700, rounded=False)
+    model_font = font(22, 700)
+    chip_font = font(11, 600, rounded=False)
+    pct_font = font(24, 800)
+    state_font = font(15, 800)
+    clock_font = font(15, 600, rounded=False)
 
     inner = width - 2 * PAD
     word, tint = STATE_STYLE[status.state]
 
-    def rule(y):
-        vector.rectangle([PAD * SS, y * SS, (width - PAD) * SS, y * SS + SS], fill=RULE + (255,))
-
-    def section(y, text):
-        write(draw, PAD, y, text, label_font, DIM, spacing=LABEL_SPACING)
-        return y + 13
-
     # ------------------------------------------------------------------ mascot
-    draw_mascot(vector, width / 2 * SS, 54 * SS, 90 * SS, status.state, phase)
+    # MASCOT_REACH is how far the outermost glow ring gets from the centre, so
+    # deriving the centre from it puts the character's first non-background pixel
+    # on MASCOT_TOP exactly -- which is what keeps it clear of the cutouts.
+    cx = width / 2
+    radius = MASCOT_SIZE * MASCOT_REACH
+    cy = MASCOT_TOP + radius
+    draw_mascot(vector, cx * SS, cy * SS, MASCOT_SIZE * SS, status.state, phase)
     if status.state == "idle":
         # The one part of the character that is cheaper to set in type than to
         # draw from primitives, because it is literally a letter.
-        write(draw, width / 2 + 27, 22, "z", font(14, 700), (128, 138, 152))
-        write(draw, width / 2 + 38, 11, "z", font(10, 700), (110, 120, 134))
+        write(draw, cx + 28, cy - 48, "z", font(20, 700), (128, 138, 152))
+        write(draw, cx + 43, cy - 64, "z", font(14, 700), (110, 120, 134))
 
-    # ------------------------------------------------- state pill under the face
-    pill_w = measure(draw, word, state_font) + LABEL_SPACING * (len(word) - 1) + 22
-    pill_x, pill_y = (width - pill_w) / 2, 107
+    # ------------------------------------------- state badge under the character
+    pill_w = min(inner, measure(draw, word, state_font) + STATE_TRACKING * (len(word) - 1) + 22)
+    pill_y = cy + radius + 14
     vector.rounded_rectangle(
-        [pill_x * SS, pill_y * SS, (pill_x + pill_w) * SS, (pill_y + 19) * SS],
-        radius=9.5 * SS, fill=tint + (36,), outline=tint + (150,), width=SS,
+        [(cx - pill_w / 2) * SS, pill_y * SS, (cx + pill_w / 2) * SS, (pill_y + PILL_H) * SS],
+        radius=PILL_H / 2 * SS, fill=tint + (36,), outline=tint + (160,), width=SS,
     )
-    write(draw, width / 2, pill_y + 4, word, state_font, tint, align="center", spacing=LABEL_SPACING)
-
-    cursor = 136
-    rule(cursor)
-    cursor += 9
-
-    # ----------------------------------------------------------------- project
-    cursor = section(cursor, "PROJECT")
-    write(draw, PAD, cursor, status.project or "no session", big_font,
-          INK if status.project else DIM, max_width=inner)
-    cursor += 21
-    if status.branch:
-        # A small clay lozenge stands in for a branch glyph; the panel has no icon
-        # font and a spelled-out "branch:" would eat a third of the width.
-        vector.rounded_rectangle(
-            [PAD * SS, (cursor + 4) * SS, (PAD + 3) * SS, (cursor + 11) * SS],
-            radius=1.5 * SS, fill=CLAY + (255,))
-        write(draw, PAD + 8, cursor, status.branch, small_font, DIM, max_width=inner - 8)
-        cursor += 15
-    cursor += 5
-
-    rule(cursor)
-    cursor += 9
+    write(draw, cx, pill_y + 6, word, state_font, tint, align="center", spacing=STATE_TRACKING)
 
     # ------------------------------------------------------------------- model
-    cursor = section(cursor, "MODEL")
-    model_width = write(draw, PAD, cursor, status.model or "--", value_font,
-                        INK if status.model else DIM, max_width=inner)
+    # The effort chip rides on the label row rather than beside the model name:
+    # at 22 px "Sonnet 5" alone is most of the panel's width, and the label row is
+    # empty on the right anyway.
+    cursor = pill_y + PILL_H + 16
+    write(draw, PAD, cursor, "MODEL", label_font, DIM, spacing=LABEL_SPACING)
     if status.effort:
-        chip_x = PAD + model_width + 6
-        chip_w = measure(draw, status.effort, tiny_font) + 10
-        if chip_x + chip_w <= width - PAD:
-            vector.rounded_rectangle(
-                [chip_x * SS, (cursor + 3) * SS, (chip_x + chip_w) * SS, (cursor + 15) * SS],
-                radius=6 * SS, fill=CLAY_DEEP + (70,), outline=CLAY_DEEP + (200,), width=SS,
-            )
-            write(draw, chip_x + 5, cursor + 4, status.effort, tiny_font, CLAY)
-    cursor += 24
-
-    rule(cursor)
-    cursor += 9
+        chip_w = measure(draw, status.effort, chip_font) + 14
+        chip_x = width - PAD - chip_w
+        vector.rounded_rectangle(
+            [chip_x * SS, (cursor - 2) * SS, (width - PAD) * SS, (cursor + 16) * SS],
+            radius=9 * SS, fill=CLAY_DEEP + (70,), outline=CLAY_DEEP + (200,), width=SS,
+        )
+        write(draw, chip_x + 7, cursor + 1, status.effort, chip_font, CLAY)
+    cursor += 15
+    write(draw, PAD, cursor, status.model or "--", model_font,
+          INK if status.model else DIM, max_width=inner)
+    cursor += 26
 
     # ------------------------------------------------------------------- usage
-    for label, data in (("5 HOUR", status.five_hour), ("WEEK", status.seven_day)):
-        write(draw, PAD, cursor, label, label_font, DIM, spacing=LABEL_SPACING)
+    # Percentage and bar only. A window's reset time is the one usage fact that
+    # cannot be set large enough to read here, so it lives in `--status` instead
+    # of stealing a row from the two that can.
+    for label, data in (("5 HR", status.five_hour), ("WEEK", status.seven_day)):
+        cursor += 16
         if data is None:
-            write(draw, width - PAD, cursor - 3, "--", pct_font, FAINT, align="right")
-            pct = 0.0
-            colour = FAINT
+            pct, colour, text = 0.0, FAINT, "--"
         else:
             pct = max(0.0, min(100.0, data["used_percentage"]))
             colour = usage_color(pct)
-            write(draw, width - PAD, cursor - 4, f"{pct:.0f}%", pct_font, colour, align="right")
-        bar_y = cursor + 15
+            text = f"{pct:.0f}%"
+        write(draw, PAD, cursor, label, label_font, DIM, spacing=LABEL_SPACING)
+        write(draw, width - PAD, cursor - 6, text, pct_font, colour, align="right")
+        bar_y = cursor + 26
         vector.rounded_rectangle(
-            [PAD * SS, bar_y * SS, (width - PAD) * SS, (bar_y + 7) * SS],
-            radius=3.5 * SS, fill=FAINT + (255,))
+            [PAD * SS, bar_y * SS, (width - PAD) * SS, (bar_y + BAR_H) * SS],
+            radius=BAR_H / 2 * SS, fill=FAINT + (255,))
         filled = inner * pct / 100.0
         if filled >= 1:
             vector.rounded_rectangle(
-                [PAD * SS, bar_y * SS, (PAD + max(7, filled)) * SS, (bar_y + 7) * SS],
-                radius=3.5 * SS, fill=colour + (255,))
-        if data is not None:
-            write(draw, PAD, bar_y + 10, f"resets in {countdown(data['resets_at'], now)}",
-                  tiny_font, DIM)
-        cursor = bar_y + 24
-
-    rule(cursor)
-    cursor += 9
-
-    # -------------------------------------------------------------------- task
-    # Whatever is left over goes to the session title, and the title is the first
-    # thing sacrificed: it is the only cell that can be dropped without the panel
-    # losing a fact you cannot get anywhere else.
-    footer_top = height - 20
-    room = footer_top - cursor - 15
-    if status.title and room >= 14:
-        section(cursor, "DOING")
-        lines = wrap(draw, status.title, small_font, inner, max(1, min(3, room // 13)))
-        y = cursor + 13
-        for line in lines:
-            write(draw, PAD, y, line, small_font, (188, 180, 169))
-            y += 13
-    elif status.state == "waiting" and status.detail:
-        section(cursor, "PROMPT")
-        for index, line in enumerate(wrap(draw, status.detail, small_font, inner, 3)):
-            write(draw, PAD, cursor + 13 + index * 13, line, small_font, WARN)
+                [PAD * SS, bar_y * SS, (PAD + max(BAR_H, filled)) * SS, (bar_y + BAR_H) * SS],
+                radius=BAR_H / 2 * SS, fill=colour + (255,))
+        cursor = bar_y + BAR_H
 
     # ------------------------------------------------------------------ footer
-    rule(footer_top)
-    clock = time.strftime("%H:%M", time.localtime(now))
-    write(draw, PAD, footer_top + 6, clock, tiny_font, DIM)
-    dot_colour = CLAY if status.online else FAINT
+    # Clock and a reachability dot. The "how long since Claude last did anything"
+    # stamp that used to sit here was 9 px of the least glanceable fact on the
+    # panel -- the character already says whether anything is happening.
+    footer_top = height - FOOTER_H
+    vector.rectangle(
+        [PAD * SS, footer_top * SS, (width - PAD) * SS, footer_top * SS + SS], fill=RULE + (255,))
+    write(draw, PAD, footer_top + 7, time.strftime("%H:%M", time.localtime(now)), clock_font, DIM)
+    dot = CLAY if status.online else FAINT
     vector.ellipse(
-        [(width - PAD - 5) * SS, (footer_top + 9) * SS, (width - PAD) * SS, (footer_top + 14) * SS],
-        fill=dot_colour + (255,))
-    if status.last_activity:
-        ago = max(0, int(now - status.last_activity))
-        stamp = f"{ago}s" if ago < 90 else (f"{ago // 60}m" if ago < 5400 else f"{ago // 3600}h")
-        write(draw, width - PAD - 9, footer_top + 6, stamp, tiny_font, FAINT, align="right")
+        [(width - PAD - 9) * SS, (footer_top + 12) * SS,
+         (width - PAD) * SS, (footer_top + 21) * SS], fill=dot + (255,))
 
     # Shapes first, then type, so the pill outlines and bars sit *behind* their
     # labels no matter what order the layout drew them in.
