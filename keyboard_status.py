@@ -734,3 +734,521 @@ def resolve_state(hook, transcript, now, config):
     if hook_state == "idle":
         return "idle"
     return "working" if fresh else "idle"
+
+
+# ------------------------------------------------------------------------- palette
+
+BG = (23, 21, 19)
+INK = (244, 239, 231)
+DIM = (133, 125, 114)
+FAINT = (58, 53, 48)
+RULE = (44, 40, 36)
+CLAY = (217, 119, 87)        # the accent this whole thing is built around
+CLAY_DEEP = (150, 76, 53)
+GOOD = (127, 176, 105)
+WARN = (232, 176, 75)
+BAD = (224, 108, 90)
+SLEEP = (108, 118, 132)
+
+STATE_STYLE = {
+    "working": ("WORKING", CLAY),
+    "waiting": ("NEEDS YOU", WARN),
+    "idle": ("IDLE", SLEEP),
+    "offline": ("NO SESSION", FAINT),
+}
+
+# Supersampling factor for every vector shape. FreeType antialiases text for us;
+# ImageDraw does not antialias anything, and a jagged mascot on a 142 px panel is
+# immediately obvious. Drawing the shapes 4x and resampling down fixes it for the
+# cost of one 568x1712 RGBA buffer per frame.
+SS = 4
+
+FONT_ROUNDED = "/System/Library/Fonts/SFNSRounded.ttf"
+FONT_TEXT = "/System/Library/Fonts/SFNS.ttf"
+FONT_CJK = "/System/Library/Fonts/PingFang.ttc"
+FONT_CJK_INDEX = 2           # PingFang SC Regular
+FONT_CJK_BOLD_INDEX = 5      # PingFang SC Medium
+
+_FONT_CACHE = {}
+
+
+def _load(path, size, weight, index=0):
+    """A TrueType font, with the variable Weight axis set when the face has one.
+
+    San Francisco ships as a variable font, so one file covers every weight -- but
+    the axis order differs between faces (SFNS has four axes, SFNSRounded two), so
+    the axis is located by name rather than by position.
+    """
+    from PIL import ImageFont
+
+    key = (path, size, weight, index)
+    cached = _FONT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        font = ImageFont.truetype(path, size, index=index)
+    except OSError:
+        font = ImageFont.load_default()
+        _FONT_CACHE[key] = font
+        return font
+    if weight is not None:
+        try:
+            axes = font.get_variation_axes()
+            values = []
+            for axis in axes:
+                name = axis.get("name")
+                name = name.decode() if isinstance(name, bytes) else str(name)
+                if name == "Weight":
+                    values.append(max(axis["minimum"], min(axis["maximum"], weight)))
+                else:
+                    values.append(axis["default"])
+            font.set_variation_by_axes(values)
+        except (OSError, AttributeError, KeyError):
+            pass  # not a variable font, or a Pillow built without FreeType support
+    _FONT_CACHE[key] = font
+    return font
+
+
+def font(size, weight=400, rounded=True):
+    """A (latin, cjk) pair. Text is drawn run by run so mixed strings just work."""
+    path = FONT_ROUNDED if rounded else FONT_TEXT
+    cjk_index = FONT_CJK_BOLD_INDEX if weight >= 550 else FONT_CJK_INDEX
+    return (_load(path, size, weight), _load(FONT_CJK, size, None, cjk_index))
+
+
+def _is_wide(char):
+    """Does this character need the CJK face (and roughly a full em of width)?"""
+    point = ord(char)
+    return (
+        0x1100 <= point <= 0x11FF
+        or 0x2E80 <= point <= 0xA4CF
+        or 0xA960 <= point <= 0xA97F
+        or 0xAC00 <= point <= 0xD7FF
+        or 0xF900 <= point <= 0xFAFF
+        or 0xFE30 <= point <= 0xFE4F
+        or 0xFF00 <= point <= 0xFF60
+        or 0xFFE0 <= point <= 0xFFE6
+    )
+
+
+def runs(text):
+    """Split into (needs_cjk_face, chunk) runs, so each is drawn with one font."""
+    out = []
+    for char in text:
+        wide = _is_wide(char)
+        if out and out[-1][0] == wide:
+            out[-1][1].append(char)
+        else:
+            out.append((wide, [char]))
+    return [(wide, "".join(chars)) for wide, chars in out]
+
+
+def measure(draw, text, fonts):
+    return sum(draw.textlength(chunk, font=fonts[1 if wide else 0]) for wide, chunk in runs(text))
+
+
+def write(draw, x, y, text, fonts, fill, align="left", max_width=None, spacing=0.0):
+    """Draw a possibly-mixed-script string, optionally letterspaced. Returns width.
+
+    `spacing` exists for the small uppercase section labels: PIL has no tracking
+    control, and at 9 px an untracked all-caps label reads as one grey smudge.
+    """
+    if max_width is not None:
+        text = elide(draw, text, fonts, max_width)
+    width = measure(draw, text, fonts) + spacing * max(0, len(text) - 1)
+    if align == "center":
+        x -= width / 2
+    elif align == "right":
+        x -= width
+    if spacing:
+        for char in text:
+            face = fonts[1 if _is_wide(char) else 0]
+            draw.text((x, y), char, font=face, fill=fill)
+            x += draw.textlength(char, font=face) + spacing
+    else:
+        for wide, chunk in runs(text):
+            face = fonts[1 if wide else 0]
+            draw.text((x, y), chunk, font=face, fill=fill)
+            x += draw.textlength(chunk, font=face)
+    return width
+
+
+def elide(draw, text, fonts, max_width):
+    """Trim from the middle, keeping both ends.
+
+    Sibling branches and sibling directories routinely differ only in their
+    suffix, so cutting the tail renders two different things identically.
+    """
+    if measure(draw, text, fonts) <= max_width:
+        return text
+    if len(text) <= 3:
+        return text
+    head, tail = len(text) // 2, len(text) // 2
+    while head > 1 and tail > 1:
+        head -= 1
+        tail -= 1
+        candidate = f"{text[:head]}…{text[len(text) - tail:]}"
+        if measure(draw, candidate, fonts) <= max_width:
+            return candidate
+    return "…"
+
+
+def wrap(draw, text, fonts, max_width, max_lines):
+    """Greedy wrap that breaks on spaces for latin and anywhere for CJK.
+
+    Session titles come back in whatever language the prompt was written in, and
+    Chinese has no spaces to break on -- a space-only wrapper emits one line the
+    width of the panel and drops the rest.
+    """
+    lines, line, last_break = [], "", -1
+    for char in text:
+        if char == "\n":
+            lines.append(line)
+            line, last_break = "", -1
+            if len(lines) >= max_lines:
+                break
+            continue
+        candidate = line + char
+        if measure(draw, candidate, fonts) <= max_width:
+            line = candidate
+            if char == " ":
+                last_break = len(line)
+            elif _is_wide(char):
+                last_break = len(line)
+            continue
+        if last_break > 0 and not _is_wide(char):
+            lines.append(line[:last_break].rstrip())
+            line = line[last_break:] + char
+        else:
+            lines.append(line)
+            line = char
+        last_break = -1
+        if len(lines) >= max_lines:
+            line = ""
+            break
+    if line and len(lines) < max_lines:
+        lines.append(line)
+    if not lines:
+        return []
+    # The overflow marker goes on the last line we kept, replacing its tail.
+    consumed = sum(len(item) for item in lines)
+    if consumed < len(text.replace("\n", "")):
+        lines[-1] = elide(draw, lines[-1] + "…", fonts, max_width)
+    return lines[:max_lines]
+
+
+# -------------------------------------------------------------------------- mascot
+#
+# An original character, drawn entirely from primitives -- no trademarked artwork,
+# no image assets to ship. A rounded nine-ray bloom in Claude's clay orange with a
+# face on its core, which is enough personality to read the session state from
+# across a desk, and cheap enough to redraw every few seconds.
+
+
+def capsule(draw, p0, p1, r0, r1, fill):
+    """A tapered round-ended bar from `p0` (radius r0) to `p1` (radius r1)."""
+    import math
+
+    (x0, y0), (x1, y1) = p0, p1
+    draw.ellipse([x0 - r0, y0 - r0, x0 + r0, y0 + r0], fill=fill)
+    draw.ellipse([x1 - r1, y1 - r1, x1 + r1, y1 + r1], fill=fill)
+    length = math.hypot(x1 - x0, y1 - y0) or 1.0
+    nx, ny = -(y1 - y0) / length, (x1 - x0) / length
+    draw.polygon(
+        [
+            (x0 + nx * r0, y0 + ny * r0),
+            (x1 + nx * r1, y1 + ny * r1),
+            (x1 - nx * r1, y1 - ny * r1),
+            (x0 - nx * r0, y0 - ny * r0),
+        ],
+        fill=fill,
+    )
+
+
+def disc(draw, cx, cy, r, fill):
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=fill)
+
+
+def draw_mascot(draw, cx, cy, size, state, phase):
+    """The character, centred on (cx, cy) and `size` across. Supersampled space.
+
+    `phase` only matters while working: the bloom turns a few degrees per frame,
+    so a display that is otherwise identical minute to minute visibly *moves* when
+    Claude is busy. It is the cheapest possible "still alive" indicator.
+    """
+    import math
+
+    body = {"working": CLAY, "waiting": WARN, "idle": (156, 99, 78), "offline": (74, 68, 62)}[state]
+    core = tuple(min(255, int(channel * 1.12) + 12) for channel in body)
+    rays = 10
+
+    # Glow. ImageDraw replaces alpha rather than blending it, so the rings are
+    # painted outside-in with rising opacity to fake a radial falloff.
+    for step in range(6, 0, -1):
+        alpha = int(12 * (7 - step) / 6)
+        disc(draw, cx, cy, size * (0.30 + 0.055 * step), body + (alpha,))
+
+    spin = phase if state == "working" else 0.0
+    for index in range(rays):
+        angle = spin + index * 2 * math.pi / rays
+        # Alternating reach keeps it from reading as a gear or a sun clip-art.
+        reach = 0.58 if index % 2 == 0 else 0.46
+        inner = (cx + math.cos(angle) * size * 0.10, cy + math.sin(angle) * size * 0.10)
+        outer = (cx + math.cos(angle) * size * reach, cy + math.sin(angle) * size * reach)
+        capsule(draw, inner, outer, size * 0.078, size * 0.034, body + (255,))
+
+    disc(draw, cx, cy, size * 0.255, core + (255,))
+
+    # ------------------------------------------------------------------ the face
+    eye_dx, eye_y = size * 0.098, cy - size * 0.038
+    eye_w, eye_h = size * 0.044, size * 0.064
+    dark = BG + (255,)
+
+    if state == "idle":
+        # Closed, curving up: asleep rather than switched off.
+        for side in (-1, 1):
+            box = [cx + side * eye_dx - eye_w * 1.5, eye_y - eye_h * 0.5,
+                   cx + side * eye_dx + eye_w * 1.5, eye_y + eye_h * 1.1]
+            draw.arc(box, 0, 180, fill=dark, width=max(1, int(size * 0.028)))
+    elif state == "offline":
+        for side in (-1, 1):
+            capsule(draw, (cx + side * eye_dx - eye_w, eye_y), (cx + side * eye_dx + eye_w, eye_y),
+                    size * 0.018, size * 0.018, dark)
+    elif state == "waiting":
+        for side in (-1, 1):
+            disc(draw, cx + side * eye_dx, eye_y, eye_h * 0.95, dark)
+            disc(draw, cx + side * eye_dx + eye_h * 0.28, eye_y - eye_h * 0.3, eye_h * 0.26, core + (255,))
+    else:
+        # Working: pupils track a slow orbit, which reads as "looking around".
+        gaze = math.cos(phase * 0.7) * size * 0.018
+        for side in (-1, 1):
+            draw.ellipse(
+                [cx + side * eye_dx - eye_w + gaze, eye_y - eye_h,
+                 cx + side * eye_dx + eye_w + gaze, eye_y + eye_h],
+                fill=dark,
+            )
+
+    mouth_y = cy + size * 0.098
+    if state == "waiting":
+        disc(draw, cx, mouth_y + size * 0.01, size * 0.038, dark)
+    elif state == "idle":
+        draw.arc([cx - size * 0.075, mouth_y - size * 0.055, cx + size * 0.075, mouth_y + size * 0.055],
+                 0, 180, fill=dark, width=max(1, int(size * 0.026)))
+    elif state == "offline":
+        capsule(draw, (cx - size * 0.05, mouth_y), (cx + size * 0.05, mouth_y),
+                size * 0.016, size * 0.016, dark)
+    else:
+        draw.ellipse([cx - size * 0.045, mouth_y - size * 0.032,
+                      cx + size * 0.045, mouth_y + size * 0.045], fill=dark)
+
+    # --------------------------------------------------------------- accessories
+    if state == "working":
+        for index in range(3):
+            angle = -phase * 1.6 + index * 2 * math.pi / 3
+            radius = size * 0.66
+            sx, sy = cx + math.cos(angle) * radius, cy + math.sin(angle) * radius * 0.82
+            twinkle = 0.45 + 0.55 * math.sin(phase * 2.2 + index * 2.1)
+            arm = size * (0.038 + 0.030 * twinkle)
+            tint = (247, 196, 150) + (int(120 + 135 * twinkle),)
+            capsule(draw, (sx - arm, sy), (sx + arm, sy), size * 0.011, size * 0.011, tint)
+            capsule(draw, (sx, sy - arm), (sx, sy + arm), size * 0.011, size * 0.011, tint)
+    elif state == "waiting":
+        # A badge, so the one state that wants your attention has a silhouette you
+        # can recognise before you have read a single word.
+        bx, by = cx + size * 0.42, cy - size * 0.42
+        disc(draw, bx, by, size * 0.145, BG + (255,))
+        disc(draw, bx, by, size * 0.115, WARN + (255,))
+        capsule(draw, (bx, by - size * 0.055), (bx, by + size * 0.012),
+                size * 0.022, size * 0.017, BG + (255,))
+        disc(draw, bx, by + size * 0.058, size * 0.021, BG + (255,))
+
+
+# -------------------------------------------------------------------------- layout
+
+PAD = 10                     # side margin; everything lives inside it
+LABEL_SPACING = 1.2          # tracking for the small uppercase section labels
+
+
+def usage_color(pct):
+    if pct >= 90:
+        return BAD
+    if pct >= 75:
+        return (226, 140, 88)
+    if pct >= 50:
+        return WARN
+    return GOOD
+
+
+def countdown(resets_at, now):
+    """Compact time until a window resets: `3d4h`, `2h13m`, `47m`."""
+    remaining = int(resets_at - now)
+    if remaining <= 0:
+        return "now"
+    days, remaining = divmod(remaining, 86400)
+    hours, remaining = divmod(remaining, 3600)
+    minutes = remaining // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m"
+
+
+def render(status, now, config, phase=0.0):
+    """Compose one frame. Returns an RGB `Image` of exactly width x height.
+
+    Two passes over two surfaces: every vector shape goes onto a 4x RGBA layer
+    that is resampled down for antialiasing, then text is drawn at final size on
+    top so FreeType's own hinting and antialiasing survive. Drawing text into the
+    supersampled layer instead would soften it noticeably at 9-11 px, which is
+    most of the type on a panel this small.
+    """
+    from PIL import Image, ImageDraw
+
+    width, height = config["width"], config["height"]
+    base = Image.new("RGB", (width, height), BG)
+    shapes = Image.new("RGBA", (width * SS, height * SS), (0, 0, 0, 0))
+    glyphs = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    vector = ImageDraw.Draw(shapes)
+    draw = ImageDraw.Draw(glyphs)
+
+    label_font = font(9, 600, rounded=False)
+    value_font = font(15, 620)
+    big_font = font(17, 700)
+    small_font = font(10, 400, rounded=False)
+    tiny_font = font(9, 400, rounded=False)
+    pct_font = font(14, 700)
+    state_font = font(10, 700)
+
+    inner = width - 2 * PAD
+    word, tint = STATE_STYLE[status.state]
+
+    def rule(y):
+        vector.rectangle([PAD * SS, y * SS, (width - PAD) * SS, y * SS + SS], fill=RULE + (255,))
+
+    def section(y, text):
+        write(draw, PAD, y, text, label_font, DIM, spacing=LABEL_SPACING)
+        return y + 13
+
+    # ------------------------------------------------------------------ mascot
+    draw_mascot(vector, width / 2 * SS, 54 * SS, 90 * SS, status.state, phase)
+    if status.state == "idle":
+        # The one part of the character that is cheaper to set in type than to
+        # draw from primitives, because it is literally a letter.
+        write(draw, width / 2 + 27, 22, "z", font(14, 700), (128, 138, 152))
+        write(draw, width / 2 + 38, 11, "z", font(10, 700), (110, 120, 134))
+
+    # ------------------------------------------------- state pill under the face
+    pill_w = measure(draw, word, state_font) + LABEL_SPACING * (len(word) - 1) + 22
+    pill_x, pill_y = (width - pill_w) / 2, 107
+    vector.rounded_rectangle(
+        [pill_x * SS, pill_y * SS, (pill_x + pill_w) * SS, (pill_y + 19) * SS],
+        radius=9.5 * SS, fill=tint + (36,), outline=tint + (150,), width=SS,
+    )
+    write(draw, width / 2, pill_y + 4, word, state_font, tint, align="center", spacing=LABEL_SPACING)
+
+    cursor = 136
+    rule(cursor)
+    cursor += 9
+
+    # ----------------------------------------------------------------- project
+    cursor = section(cursor, "PROJECT")
+    write(draw, PAD, cursor, status.project or "no session", big_font,
+          INK if status.project else DIM, max_width=inner)
+    cursor += 21
+    if status.branch:
+        # A small clay lozenge stands in for a branch glyph; the panel has no icon
+        # font and a spelled-out "branch:" would eat a third of the width.
+        vector.rounded_rectangle(
+            [PAD * SS, (cursor + 4) * SS, (PAD + 3) * SS, (cursor + 11) * SS],
+            radius=1.5 * SS, fill=CLAY + (255,))
+        write(draw, PAD + 8, cursor, status.branch, small_font, DIM, max_width=inner - 8)
+        cursor += 15
+    cursor += 5
+
+    rule(cursor)
+    cursor += 9
+
+    # ------------------------------------------------------------------- model
+    cursor = section(cursor, "MODEL")
+    model_width = write(draw, PAD, cursor, status.model or "--", value_font,
+                        INK if status.model else DIM, max_width=inner)
+    if status.effort:
+        chip_x = PAD + model_width + 6
+        chip_w = measure(draw, status.effort, tiny_font) + 10
+        if chip_x + chip_w <= width - PAD:
+            vector.rounded_rectangle(
+                [chip_x * SS, (cursor + 3) * SS, (chip_x + chip_w) * SS, (cursor + 15) * SS],
+                radius=6 * SS, fill=CLAY_DEEP + (70,), outline=CLAY_DEEP + (200,), width=SS,
+            )
+            write(draw, chip_x + 5, cursor + 4, status.effort, tiny_font, CLAY)
+    cursor += 24
+
+    rule(cursor)
+    cursor += 9
+
+    # ------------------------------------------------------------------- usage
+    for label, data in (("5 HOUR", status.five_hour), ("WEEK", status.seven_day)):
+        write(draw, PAD, cursor, label, label_font, DIM, spacing=LABEL_SPACING)
+        if data is None:
+            write(draw, width - PAD, cursor - 3, "--", pct_font, FAINT, align="right")
+            pct = 0.0
+            colour = FAINT
+        else:
+            pct = max(0.0, min(100.0, data["used_percentage"]))
+            colour = usage_color(pct)
+            write(draw, width - PAD, cursor - 4, f"{pct:.0f}%", pct_font, colour, align="right")
+        bar_y = cursor + 15
+        vector.rounded_rectangle(
+            [PAD * SS, bar_y * SS, (width - PAD) * SS, (bar_y + 7) * SS],
+            radius=3.5 * SS, fill=FAINT + (255,))
+        filled = inner * pct / 100.0
+        if filled >= 1:
+            vector.rounded_rectangle(
+                [PAD * SS, bar_y * SS, (PAD + max(7, filled)) * SS, (bar_y + 7) * SS],
+                radius=3.5 * SS, fill=colour + (255,))
+        if data is not None:
+            write(draw, PAD, bar_y + 10, f"resets in {countdown(data['resets_at'], now)}",
+                  tiny_font, DIM)
+        cursor = bar_y + 24
+
+    rule(cursor)
+    cursor += 9
+
+    # -------------------------------------------------------------------- task
+    # Whatever is left over goes to the session title, and the title is the first
+    # thing sacrificed: it is the only cell that can be dropped without the panel
+    # losing a fact you cannot get anywhere else.
+    footer_top = height - 20
+    room = footer_top - cursor - 15
+    if status.title and room >= 14:
+        section(cursor, "DOING")
+        lines = wrap(draw, status.title, small_font, inner, max(1, min(3, room // 13)))
+        y = cursor + 13
+        for line in lines:
+            write(draw, PAD, y, line, small_font, (188, 180, 169))
+            y += 13
+    elif status.state == "waiting" and status.detail:
+        section(cursor, "PROMPT")
+        for index, line in enumerate(wrap(draw, status.detail, small_font, inner, 3)):
+            write(draw, PAD, cursor + 13 + index * 13, line, small_font, WARN)
+
+    # ------------------------------------------------------------------ footer
+    rule(footer_top)
+    clock = time.strftime("%H:%M", time.localtime(now))
+    write(draw, PAD, footer_top + 6, clock, tiny_font, DIM)
+    dot_colour = CLAY if status.online else FAINT
+    vector.ellipse(
+        [(width - PAD - 5) * SS, (footer_top + 9) * SS, (width - PAD) * SS, (footer_top + 14) * SS],
+        fill=dot_colour + (255,))
+    if status.last_activity:
+        ago = max(0, int(now - status.last_activity))
+        stamp = f"{ago}s" if ago < 90 else (f"{ago // 60}m" if ago < 5400 else f"{ago // 3600}h")
+        write(draw, width - PAD - 9, footer_top + 6, stamp, tiny_font, FAINT, align="right")
+
+    # Shapes first, then type, so the pill outlines and bars sit *behind* their
+    # labels no matter what order the layout drew them in.
+    flattened = shapes.resize((width, height), Image.LANCZOS)
+    base.paste(flattened, (0, 0), flattened)
+    base.paste(glyphs, (0, 0), glyphs)
+    return base
