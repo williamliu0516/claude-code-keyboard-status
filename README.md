@@ -61,12 +61,22 @@ Your `keyboard-status.json` is left alone, and so is
 
 | Cell | Set at | Reads as |
 | --- | --- | --- |
-| character | 106 px / 16.7 mm | the session state, as a pose — see the table below |
-| state badge | 25 px cap / 22.5′ | `BUSY` · `YOU` · `IDLE` · `OFF` |
+| `5H` / `7D` | **25 px cap / 22.5′** | percent of the 5-hour and weekly windows used, over a 20 px meter |
 | model | 24 px cap / 21.6′ | `Opus 5`, `Sonnet 5`, … auto-fitted to the width |
-| `5H` / `7D` | 25 px cap / 22.5′ | percent of the 5-hour and weekly windows used, over a 20 px meter |
+| character | 80 px / 12.6 mm / 72′ | the session state, as a pose — see the table below |
+| state badge | 20 px cap / 18.0′ | `BUSY` · `YOU` · `IDLE` · `OFF` |
+| clock | 20 px cap / 18.0′ | local time, centred under a rule |
 
 Meters are green below 50%, amber to 75%, orange to 90%, red above.
+
+The order of that table is the order of the hierarchy, and it is not the order
+things appear on screen. The two meters and the model name are why the panel
+exists, so they hold `CORE_SIZE` unconditionally. The character and the badge are
+emphasis — they make the panel readable *as a shape* from further away than any
+text — so they are what gives ground when the budget runs short. The character was
+106 px and is now 80: still 12.6 mm across, still 72 arcmin, still in no danger of
+being hard to see, and 26 px shorter. The badge went from 47 px tall to 34. That
+bought back the clock, which had been cut in the previous round.
 
 ## How the sizes were chosen
 
@@ -146,8 +156,10 @@ because it still costs the space. The trades:
   in, the terminal is right there.
 - **reset countdowns** — the least urgent usage fact, and a whole row per meter.
 - **effort** — needs its own row at a readable size, and `MODEL` outranks it.
-- **clock and activity stamp** — your computer has a clock, and the character
-  already answers "is anything happening".
+- **activity stamp** — the character already answers "is anything happening".
+- **the clock** — cut for one round to buy cap height, then bought back when the
+  character and badge gave up 40 px. It sits at `STATE_SIZE`, not `CORE_SIZE`:
+  legible at 600 mm and visibly not competing with the numbers above it.
 
 All of it is still collected. Only the drawing stopped.
 
@@ -163,12 +175,74 @@ All of it is still collected. Only the drawing stopped.
 The bloom advances a few degrees every tick while working, which makes "still
 alive" legible without reading anything. In every other state it holds still.
 
-At 16.7 mm across, the character is the one element far above every readability
-threshold, which is why it carries the fact you most need from across a desk. It
+At 12.6 mm across the character subtends 72 arcmin — more than three times the
+22′ target — which is why it is the element that gets shrunk when something has to
+give, and why it still reads from further away than any of the type. It
 used to throw three twinkles onto a wide orbit while working; they were ~9 arcmin
 — under the threshold where anything resolves — and that orbit, not the bloom, was
 what capped the character's size, because it clipped both margins first. Dropping
 them bought 6 px of bloom, which you can actually see.
+
+## Is it actually point-to-point?
+
+The rendered frame is exactly 142×428 with no resampling anywhere in our pipeline,
+so a soft-looking panel has three possible causes, and guessing between them is
+pointless. `--testcard` settles it:
+
+```sh
+keyboard_status.py --testcard              # POST it to the panel
+keyboard_status.py --testcard card.png     # or just look at it locally
+```
+
+![the resolution card](docs/testcard.png)
+
+Geometry only — no state, no layout, and no fonts on the fine bands:
+
+| Rows | Pattern | What softness there means |
+| --- | --- | --- |
+| 0–48 | 8 px ladder, red band above the 40 px line, green below | if no red is visible, `DEAD_ZONE` is right |
+| 48–96 | 1 px checkerboard | flat grey = the device is rescaling |
+| 96–192 | 1 px vertical, then horizontal lines | which axis the scaler loses |
+| 192–256 | 2 px and 4 px vertical lines | if even 4 px is soft, it is the panel itself |
+| 256–304 | 16 px hard-edged blocks | **the control.** Nothing in our pipeline can blur an edge this coarse |
+| 304–390 | text at 34 / 28 / 22, native size | compare against the blocks |
+| 390–428 | a disc and a diagonal | the only things that *should* have grey edge pixels |
+
+### What was ruled out on this side, with numbers
+
+Measured, not assumed — the card round-trips through our own encoder and gets
+compared to the source bitmap pixel by pixel:
+
+| Band | Max error after JPEG | Contrast surviving |
+| --- | --- | --- |
+| 1 px vertical lines | **0** / 255 | 255 / 255 |
+| 1 px horizontal lines | **0** / 255 | 255 / 255 |
+| 2 px / 4 px / 16 px | **0** / 255 | 255 / 255 |
+| 1 px checkerboard | 2 / 255 | 255 / 255 |
+| text | 8 / 255 | 255 / 255 |
+
+A 1 px checkerboard is very nearly a pure DCT basis function, so 4:4:4 JPEG carries
+it almost exactly — which is what makes the card a clean test rather than a test of
+JPEG. **Whatever softness appears on the glass was added after the POST.**
+
+Two of the three suspects are therefore dead:
+
+- **Our JPEG is not the problem, but it was not free either.** The frame was going
+  out at quality 88, where the worst-case error on a rendered edge is 40/255. At 95
+  it is 22/255, for 17 KB → 26 KB against a 512 KB ceiling. That was pure waste, so
+  the default is now 95. It will not fix a rescaling panel; it does sharpen every
+  edge slightly, and it cost nothing.
+- **Text was never supersampled.** `SS = 4` applies only to the vector layer — the
+  character, the badge outline, the meters. Glyphs are drawn at final size straight
+  onto a native-resolution layer specifically so FreeType's own hinting survives,
+  which is what the two-surface split in `render()` is for. Grey pixels on the edge
+  of a letter at this size are FreeType antialiasing, and removing them would make
+  22 px type look worse, not sharper.
+
+Which leaves the third: if the fine bands read as flat grey while the 16 px blocks
+are crisp, the device is resampling 142×428 to some other native panel resolution,
+and nothing on this side reaches that. See
+[known limitations](#known-limitations).
 
 ## Why a daemon *and* hooks
 
@@ -254,7 +328,7 @@ response cannot stall the display.
 | `heartbeat_seconds` | `300` | push an unchanged frame at least this often |
 | `offline_backoff_seconds` | `20` | wait after a failed push, growing to 60 s |
 | `http_timeout_seconds` | `4` | POST timeout |
-| `jpeg_quality` | `88` | 30–95 |
+| `jpeg_quality` | `95` | 30–95; see [is it actually point-to-point?](#is-it-actually-point-to-point) for why it is not 88 |
 | `active_seconds` | `45` | transcript movement newer than this counts as working |
 | `session_ttl_seconds` | `21600` | after this, a session stops being the current one |
 | `usage_poll_seconds` | `60` | shared with claude-status-bar's own throttle |
@@ -281,6 +355,7 @@ mostly useful for one-off runs.
 | `--daemon` | run the push loop in the foreground (what launchd runs) |
 | `--once` | render and push a single frame; exits non-zero if the push failed |
 | `--preview out.png [state]` | render to a file without pushing; force a pose to see it |
+| `--testcard [PATH]` | the resolution card: POST it, or write it to `PATH` |
 | `--status` | dump the resolved status as JSON — the first stop when debugging |
 
 Logs go to `~/.claude/keyboard-status.log`.
@@ -296,8 +371,9 @@ curl -X POST --data-binary @image.jpg -H 'Content-Type: image/jpeg' \
 
 It takes **baseline** JPEG only, at most 512 KB. Pillow writes baseline unless you
 ask for progressive, so `encode` simply never passes `progressive`; at 142×428 a
-frame is about 15 KB, and the quality-reduction loop guarding the ceiling is there
-for a bigger future panel rather than for this one.
+frame is about 21 KB at quality 95, and the quality-reduction loop guarding the
+ceiling is there for a bigger future panel rather than for this one — it has never
+run.
 
 The top 40 rows of that panel are behind the device's own cutouts — see
 [the top 40 rows are not yours](#the-top-40-rows-are-not-yours). If your keyboard's
@@ -315,6 +391,13 @@ layout looks the way it does.
 - **One session on screen at a time.** With several sessions running, the panel
   follows whichever moved most recently, and does not say which one it picked —
   `--status` does. There is no room on 142 px to do better.
+- **The panel may be resampling us, and we would not know.** 142×428 is the size
+  the upload API accepts; whether it is the glass's native grid is not something
+  the device reports. Our side is verifiably point-to-point — see
+  [is it actually point-to-point?](#is-it-actually-point-to-point) for the
+  per-band numbers — so if `--testcard`'s 1 px bands come up as flat grey while its
+  16 px blocks are crisp, the resampling is happening downstream of the POST and
+  there is no setting on this side that reaches it. Nothing to do but know it.
 - **No authentication, no TLS.** The device offers neither, so the daemon assumes a
   LAN it trusts. Do not expose that endpoint to a network you do not control.
 - **A sleeping panel drops frames.** Some of these keyboards power the display down

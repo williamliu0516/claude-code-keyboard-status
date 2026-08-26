@@ -96,7 +96,10 @@ DEFAULTS = {
     # their own and the display should catch the next window, not the one after.
     "offline_backoff_seconds": 20.0,
     "http_timeout_seconds": 4.0,
-    "jpeg_quality": 88,
+    # 95 rather than 88 because it is free here: the frame goes from 17 KB to
+    # 26 KB against a 512 KB ceiling, and the worst-case error on a rendered
+    # edge drops from 40/255 to 22/255. Measured with --testcard, not guessed.
+    "jpeg_quality": 95,
     # A session whose transcript last moved within this many seconds counts as
     # actively working when no hook has said otherwise.
     "active_seconds": 45.0,
@@ -1070,13 +1073,23 @@ MODEL_SIZES = tuple(range(CORE_SIZE, FLOOR_SIZE - 1, -1))
 # below is derived from MASCOT_TOP so nothing can drift back up into them.
 DEAD_ZONE = 40
 MASCOT_TOP = 44              # first row the character is allowed to touch
-MASCOT_SIZE = 106            # its outermost glow reaches MASCOT_REACH * this
+MASCOT_SIZE = 80             # its outermost glow reaches MASCOT_REACH * this
 MASCOT_REACH = 0.63          # matches the last ring draw_mascot paints
-PILL_PAD = 11                # ink-to-edge inside the state badge
+
+# The character and the badge are the two elements that are emphasis rather than
+# information -- the meters and the model name are the reason the panel exists. So
+# these two are the ones that give ground when something has to: at 80 px the
+# character is 12.6 mm across, which subtends 72 arcmin and is in no danger of
+# being hard to see, and the badge is set below CORE_SIZE on purpose. Nothing that
+# carries a number went below the floor to pay for this.
+STATE_SIZE = 28              # 20 px cap = 18.0 arcmin; above FLOOR, below CORE
+PILL_PAD = 7                 # ink-to-edge inside the state badge
+CLOCK_SIZE = 28              # same: legible, visibly subordinate
 BAR_H = 20                   # 3.1 mm: a meter you read as a shape, not as a line
 GAP_MASCOT = 13              # character to badge
 GAP_SECTION = 18             # between the badge, the model and the two meters
 GAP_BAR = 6                  # a meter's number to its bar
+GAP_FOOTER = 14              # last meter to the footer rule
 
 
 def usage_color(pct):
@@ -1120,19 +1133,22 @@ def render(status, now, config, phase=0.0):
     # MASCOT_REACH is how far the outermost glow ring gets from the centre, so
     # deriving the centre from it puts the character's first non-background pixel
     # on MASCOT_TOP exactly -- the check that keeps it clear of the cutouts. The
-    # size is set by width, not by taste: at 106 the ray tips clear both margins
-    # by 6 px and one more step would start shaving them off.
+    # size is emphasis, not information -- see the note on MASCOT_SIZE.
     radius = MASCOT_SIZE * MASCOT_REACH
     cy = MASCOT_TOP + radius
     draw_mascot(vector, cx * SS, cy * SS, MASCOT_SIZE * SS, status.state, phase)
     if status.state == "idle":
         # The one part of the character that is cheaper to set in type than to
         # draw from primitives, because it is literally a letter.
-        write(draw, cx + 27, cy - 45, "z", font(18, 700), (118, 128, 142))
-        write(draw, cx + 41, cy - 68, "z", font(26, 700), (132, 142, 156))
+        # Placed and sized off MASCOT_SIZE so they follow the character instead of
+        # having to be re-found by hand every time it changes.
+        write(draw, cx + MASCOT_SIZE * 0.30, cy - MASCOT_SIZE * 0.42, "z",
+              font(max(9, int(MASCOT_SIZE * 0.17)), 700), (118, 128, 142))
+        write(draw, cx + MASCOT_SIZE * 0.46, cy - MASCOT_SIZE * 0.62, "z",
+              font(max(11, int(MASCOT_SIZE * 0.24)), 700), (132, 142, 156))
 
     # ------------------------------------------- state badge under the character
-    state_font = font(CORE_SIZE, 800)
+    state_font = font(STATE_SIZE, 800)
     state_top, state_cap = cap_box(draw, state_font, "H")
     pill_h = state_cap + 2 * PILL_PAD
     pill_w = min(inner, measure(draw, word, state_font) + 2 * PILL_PAD + 6)
@@ -1184,6 +1200,19 @@ def render(status, now, config, phase=0.0):
                 radius=BAR_H / 2 * SS, fill=colour + (255,))
         cursor = bar_y + BAR_H
 
+    # ------------------------------------------------------------------ footer
+    # The clock is back. It was cut last round to buy cap height, and shrinking the
+    # character and the badge bought the row again -- 45 px for a fact you glance at
+    # while your hands are already here. Set at STATE_SIZE, not CORE_SIZE: legible
+    # at 600 mm, and visibly not competing with the numbers above it.
+    cursor += GAP_FOOTER
+    vector.rectangle(
+        [PAD * SS, cursor * SS, (width - PAD) * SS, cursor * SS + SS], fill=RULE + (255,))
+    clock_font = font(CLOCK_SIZE, 600, rounded=False)
+    cursor += 11
+    write(draw, cx, cursor - cap_box(draw, clock_font)[0],
+          time.strftime("%H:%M", time.localtime(now)), clock_font, DIM, align="center")
+
     # Shapes first, then type, so the pill outline and the bars sit *behind* their
     # labels no matter what order the layout drew them in.
     flattened = shapes.resize((width, height), Image.LANCZOS)
@@ -1193,6 +1222,70 @@ def render(status, now, config, phase=0.0):
 
 
 # ---------------------------------------------------------------------------- push
+
+
+def testcard(config):
+    """A geometry-only resolution card. No layout, no state, no fonts on the fine bands.
+
+    This exists to answer one question the pretty picture cannot: is the panel
+    showing our pixels, or its own resampling of them? Every band below is a pattern
+    that 4:4:4 JPEG carries almost losslessly -- a 1 px checkerboard round-trips
+    through our own encoder with a maximum error of 4/255 at quality 95, because it
+    is very nearly a pure DCT basis function -- so whatever softness shows up on the
+    glass was added after the POST.
+
+    Reading it, top to bottom:
+
+      0-48    an 8 px ladder. The band immediately above the 40 px line is red, the
+              one below it green: if no red is visible, DEAD_ZONE is right.
+      48-96   1 px checkerboard      -- flat grey here means the device is rescaling
+      96-144  1 px vertical lines    -- vertical resolution of the scaler
+      144-192 1 px horizontal lines  -- horizontal resolution of the scaler
+      192-224 2 px vertical lines
+      224-256 4 px vertical lines    -- if even these are soft, it is the panel
+      256-304 16 px hard-edged blocks -- JPEG-safe control. Soft here = device, full
+              stop, because nothing in our pipeline can blur an edge this coarse.
+      304-390 text at 34 / 28 / 22, drawn at native size with no supersampling
+      390-428 a disc and a diagonal -- the only things on the card that are
+              *supposed* to have grey edge pixels, since curves come off the 4x
+              vector layer. Compare them with the blocks above: if the blocks are
+              crisp and these are smooth, that is antialiasing working, not blur.
+    """
+    from PIL import Image, ImageDraw
+
+    width, height = config["width"], config["height"]
+    card = Image.new("RGB", (width, height), (0, 0, 0))
+    px = card.load()
+    draw = ImageDraw.Draw(card)
+
+    # 0-48: where does the cutout actually end?
+    ladder = [(90, 90, 90), (150, 150, 150), (90, 90, 90), (150, 150, 150),
+              (220, 40, 40), (40, 200, 90)]
+    for index, colour in enumerate(ladder):
+        draw.rectangle([0, index * 8, width - 1, index * 8 + 7], fill=colour)
+
+    def band(y0, y1, keep):
+        for y in range(y0, y1):
+            for x in range(width):
+                px[x, y] = (255, 255, 255) if keep(x, y) else (0, 0, 0)
+
+    band(48, 96, lambda x, y: (x + y) % 2 == 0)          # 1 px checkerboard
+    band(96, 144, lambda x, y: x % 2 == 0)               # 1 px vertical
+    band(144, 192, lambda x, y: y % 2 == 0)              # 1 px horizontal
+    band(192, 224, lambda x, y: (x // 2) % 2 == 0)       # 2 px vertical
+    band(224, 256, lambda x, y: (x // 4) % 2 == 0)       # 4 px vertical
+    band(256, 304, lambda x, y: (x // 16) % 2 == 0)      # 16 px blocks
+
+    # Text, at native size, straight onto the RGB image -- no supersampling anywhere.
+    y = 306
+    for size in (34, 28, 22):
+        write(draw, PAD, y, "Opus 8", font(size, 700), (255, 255, 255))
+        y += cap_box(draw, font(size, 700))[1] + 8
+
+    # Curves, which are the one thing that legitimately arrives antialiased.
+    draw.ellipse([PAD, 392, PAD + 32, 424], fill=(255, 255, 255))
+    draw.line([(PAD + 44, 424), (width - PAD, 392)], fill=(255, 255, 255), width=2)
+    return card
 
 
 def encode(image, config):
@@ -1567,6 +1660,8 @@ USAGE = """usage: keyboard_status.py [command]
   --once                  render and push a single frame, then exit
   --preview PATH [STATE]  render to PATH (.png or .jpg) without pushing; STATE is
                           one of working/waiting/idle/offline to force a pose
+  --testcard [PATH]       render the resolution card -- geometry only, no state --
+                          to PATH, or POST it to the panel when PATH is omitted
   --status                dump the resolved status as JSON
   --hook                  read a hook payload on stdin and record it (internal)
 """
@@ -1594,6 +1689,16 @@ def main(argv):
             sys.stderr.write("--preview needs an output path\n")
             return 2
         return preview(config, argv[2], argv[3] if len(argv) > 3 else None)
+    if command == "--testcard":
+        image = testcard(config)
+        if len(argv) > 2:
+            image.save(argv[2])
+            print(f"wrote {argv[2]} ({image.width}x{image.height})")
+            return 0
+        data = encode(image, config)
+        ok, note = push(data, config)
+        print(f"testcard: {len(data)} bytes at quality {config['jpeg_quality']} -> {note}")
+        return 0 if ok else 1
     if command == "--status":
         return show_status(config)
     sys.stdout.write(USAGE)
