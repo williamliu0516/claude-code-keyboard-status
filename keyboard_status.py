@@ -1252,3 +1252,111 @@ def render(status, now, config, phase=0.0):
     base.paste(flattened, (0, 0), flattened)
     base.paste(glyphs, (0, 0), glyphs)
     return base
+
+
+# ---------------------------------------------------------------------------- push
+
+
+def encode(image, config):
+    """Baseline JPEG bytes, sized to fit the device's 512 KB ceiling.
+
+    The keyboard rejects progressive JPEG, so `progressive` is never passed --
+    Pillow's default is baseline and it stays that way. At 142x428 even quality 95
+    lands around 20 KB, so the shrink loop below is a guard against a future
+    larger panel rather than something this resolution will ever reach.
+    """
+    import io
+
+    quality = max(30, min(95, int(config["jpeg_quality"])))
+    while True:
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=quality, optimize=True, subsampling=0)
+        data = buffer.getvalue()
+        if len(data) <= 512 * 1024 or quality <= 30:
+            return data
+        quality -= 10
+
+
+def push(data, config):
+    """POST the frame. Returns (ok, note); never raises, never blocks for long.
+
+    A keyboard that is asleep, unplugged or on another network is the normal case,
+    not an error -- this runs on a laptop that moves. The caller backs off and the
+    display simply keeps whatever frame it last received.
+    """
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        config["url"], data=data, method="POST",
+        headers={"Content-Type": "image/jpeg", "Content-Length": str(len(data))},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=config["http_timeout_seconds"]) as response:
+            return 200 <= response.status < 300, f"HTTP {response.status}"
+    except urllib.error.HTTPError as error:
+        return False, f"HTTP {error.code}"
+    except urllib.error.URLError as error:
+        return False, str(getattr(error, "reason", error))
+    except (OSError, ValueError, TimeoutError) as error:
+        return False, str(error)
+
+
+# -------------------------------------------------------------------------- daemon
+
+
+def log(message):
+    """One line, timestamped, to stderr -- launchd routes it into the log file."""
+    sys.stderr.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    sys.stderr.flush()
+
+
+def run_daemon(config, once=False):
+    """Render on a fixed tick; push when the frame changed or the heartbeat is due.
+
+    The tick is what keeps the countdowns honest; the change check is what keeps
+    the network quiet. Between them the keyboard sees a POST roughly once a minute
+    while idle -- the clock cell rolling over -- and once per tick while Claude is
+    working and the character is spinning.
+    """
+    import hashlib
+
+    last_digest = None
+    last_push = 0.0
+    offline_until = 0.0
+    online = True
+    phase = 0.0
+    failures = 0
+
+    while True:
+        started = time.time()
+        try:
+            status = collect(started, config, blocking=once)
+            status.online = online
+            phase += 0.55
+            frame = encode(render(status, started, config, phase=phase), config)
+            digest = hashlib.sha1(frame).digest()
+
+            due = digest != last_digest or started - last_push >= config["heartbeat_seconds"]
+            if due and started >= offline_until:
+                ok, note = push(frame, config)
+                if ok:
+                    if not online:
+                        log(f"keyboard back online ({note})")
+                    online, failures, offline_until = True, 0, 0.0
+                    last_digest, last_push = digest, started
+                else:
+                    failures += 1
+                    online = False
+                    # Grows, but only to a minute: a panel that sleeps between
+                    # uploads has to be caught while it is briefly awake.
+                    wait = min(60.0, config["offline_backoff_seconds"] * min(failures, 3))
+                    offline_until = started + wait
+                    if failures == 1 or failures % 20 == 0:
+                        log(f"push failed ({note}); retrying in {wait:.0f}s [{failures}]")
+        except Exception as error:  # noqa: BLE001 - a daemon that dies is a bug
+            log(f"tick failed: {type(error).__name__}: {error}")
+        if once:
+            return 0 if online else 1
+        elapsed = time.time() - started
+        time.sleep(max(0.5, config["tick_seconds"] - elapsed))
