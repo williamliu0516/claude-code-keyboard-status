@@ -5,3 +5,4 @@ out/
 *.jpg
 *.png
 !docs/*.png
+*.egg-info/
