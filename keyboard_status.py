@@ -462,15 +462,28 @@ def record_hook_event(payload, now, ttl):
     if state == "ended":
         sessions.pop(session, None)
     else:
+        previous = sessions.get(session)
+        previous = previous if isinstance(previous, dict) else {}
         entry = {"state": state, "event": event, "at": now}
-        cwd = payload.get("cwd")
+        cwd = payload.get("cwd") or previous.get("cwd")
         if isinstance(cwd, str) and cwd:
             entry["cwd"] = cwd
-        transcript = payload.get("transcript_path")
+        transcript = payload.get("transcript_path") or previous.get("transcript")
         if isinstance(transcript, str) and transcript:
             entry["transcript"] = transcript
         if message:
             entry["message"] = message[:200]
+        # Turn bookkeeping: a turn starts at UserPromptSubmit and ends at Stop.
+        # The start survives intermediate events so "elapsed this turn" and
+        # "how long the last turn took" are both one subtraction for a reader.
+        if event == "UserPromptSubmit":
+            entry["turn_started_at"] = now
+        elif isinstance(previous.get("turn_started_at"), (int, float)):
+            entry["turn_started_at"] = previous["turn_started_at"]
+        if event == "Stop" and isinstance(entry.get("turn_started_at"), (int, float)):
+            entry["last_turn_seconds"] = max(0.0, now - entry["turn_started_at"])
+        elif isinstance(previous.get("last_turn_seconds"), (int, float)):
+            entry["last_turn_seconds"] = previous["last_turn_seconds"]
         sessions[session] = entry
 
     # Sessions that died without firing SessionEnd -- a killed terminal, a crash --
@@ -493,6 +506,24 @@ def record_hook_event(payload, now, ttl):
 _TRANSCRIPT_CACHE = {}
 
 
+def salient_input(tool_input):
+    """The one field of a tool_use input worth showing on a tiny display.
+
+    A file path becomes its basename; a command keeps its head. Anything
+    longer than a display could ever want is cut here rather than in every
+    renderer.
+    """
+    for key in ("file_path", "path", "notebook_path"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value:
+            return os.path.basename(value.rstrip("/"))[:80]
+    for key in ("command", "pattern", "query", "url", "description", "prompt"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().splitlines()[0][:80]
+    return None
+
+
 class Transcript:
     """Incrementally extracted facts about one session's .jsonl transcript.
 
@@ -511,6 +542,13 @@ class Transcript:
         self.title = None
         self.last_prompt = None
         self.last_event = 0.0
+        # Latest tool call and latest TodoWrite payload, for displays that show
+        # "what is it doing" / "how far through the plan is it". Same
+        # incremental read; assistant records already pass the interesting-line
+        # check, so absorbing their tool_use blocks costs nothing extra.
+        self.tool_name = None
+        self.tool_target = None
+        self.todos = None
 
     def refresh(self):
         try:
@@ -568,6 +606,22 @@ class Transcript:
                 self.effort = record["effort"]
             if isinstance(record.get("cwd"), str):
                 self.cwd = record["cwd"]
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    name = block.get("name")
+                    if not isinstance(name, str) or not name:
+                        continue
+                    tool_input = block.get("input")
+                    tool_input = tool_input if isinstance(tool_input, dict) else {}
+                    if name == "TodoWrite":
+                        todos = tool_input.get("todos")
+                        if isinstance(todos, list):
+                            self.todos = [t for t in todos if isinstance(t, dict)]
+                    self.tool_name = name
+                    self.tool_target = salient_input(tool_input)
 
 
 def newest_transcripts(limit=6):

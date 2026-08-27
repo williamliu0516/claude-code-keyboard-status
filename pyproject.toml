@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-keyboard-status"
+version = "0.2.0"
+description = "Claude Code status on a keyboard's 142x428 image display; importable as the keyboard_status library"
+requires-python = ">=3.9"
+# Pillow is imported lazily, only on the render path; library consumers that
+# just want collect()/Transcript/current_usage don't need it installed.
+dependencies = []
+
+[tool.setuptools]
+py-modules = ["keyboard_status"]
