@@ -19,7 +19,7 @@ below.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/williamliu0516/claude-code-keyboard-status/main/install.sh | sh
+curl -fsSL https://xiaweiliu.com/claude-code-keyboard-status/install.sh | sh
 ```
 
 That downloads `keyboard_status.py` to `~/.claude/`, builds a private virtualenv
@@ -31,8 +31,29 @@ Needs macOS, `python3` (3.8+) with `venv`, and `curl` or `wget`. Then open a new
 session, or restart an existing one, for the hooks to load — the daemon starts
 pushing immediately either way.
 
-The keyboard defaults to `192.168.0.12`. To point it somewhere else, edit `url` in
-`~/.claude/keyboard-status.json` and the daemon picks it up on its next tick.
+The keyboard's address has no default — it is whatever DHCP handed your panel —
+so the daemon refuses to push until you set `url` in
+`~/.claude/keyboard-status.json`, which it then picks up on its next tick:
+
+```sh
+echo '{"url": "http://192.168.1.50/image/upload"}' > ~/.claude/keyboard-status.json
+launchctl kickstart -k gui/$(id -u)/com.williamliu.claude-keyboard-status
+```
+
+Find the address on the panel's own display or settings app, or look for a new
+device in your router's client list. A wrong address fails as silence — frames
+POSTed into the void — which is why an unset one stops the daemon outright
+rather than letting it look like it is working.
+
+**Want the context-aware screens instead?**
+[context-keyboard-display](https://github.com/williamliu0516/context-keyboard-display)
+supersedes this daemon as the panel's pusher, imports this repo as its library,
+and its one-command install asks for the address, sets up both halves, and needs
+no separate install of this one:
+
+```sh
+curl -fsSL https://xiaweiliu.com/context-keyboard-display/install.sh | sh
+```
 
 <details>
 <summary>Install from a clone, or without hooks</summary>
@@ -375,7 +396,7 @@ response cannot stall the display.
 
 | Key | Default | Effect |
 | --- | --- | --- |
-| `url` | `http://192.168.0.12/image/upload` | where frames are POSTed |
+| `url` | *(none — must be set)* | where frames are POSTed |
 | `width` / `height` | `142` / `428` | panel size; the layout is tuned for this one |
 | `tick_seconds` | `5` | render cadence, and so how fast a state change shows up |
 | `heartbeat_seconds` | `300` | push an unchanged frame at least this often |
@@ -419,7 +440,7 @@ The panel accepts a raw `POST` of JPEG bytes:
 
 ```sh
 curl -X POST --data-binary @image.jpg -H 'Content-Type: image/jpeg' \
-  http://192.168.0.12/image/upload
+  http://YOUR-PANEL-IP/image/upload
 ```
 
 It takes **baseline** JPEG only, at most 512 KB. Pillow writes baseline unless you
@@ -435,6 +456,21 @@ dead zone is a different height, change `DEAD_ZONE` and `MASCOT_TOP` together.
 At 2.79 in on the diagonal that is 161.6 ppi over 22.3 mm × 67.3 mm — see
 [how the sizes were chosen](#how-the-sizes-were-chosen), which is most of why this
 layout looks the way it does.
+
+## Security notes
+
+**The panel speaks plain HTTP**, so frames leave unencrypted and
+unauthenticated: anyone on the same network can read them off the wire, or POST
+their own image to the display. This daemon's own screens carry only a state
+word, a model name and usage percentages — but
+[context-keyboard-display](https://github.com/williamliu0516/context-keyboard-display),
+which imports this repo as a library, renders your live TODO item's *text* onto
+the same panel. Fine on a home network; think twice on shared Wi-Fi.
+
+**The usage meters read your Claude Code OAuth token** from the login Keychain
+and `~/.claude/.credentials.json`, and send it to `api.anthropic.com` and
+nowhere else. Neither store is ever written back to. Skip the meters entirely by
+leaving the token unreadable — the other screens work without them.
 
 ## Known limitations
 

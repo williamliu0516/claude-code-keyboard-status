@@ -78,10 +78,17 @@ LAUNCH_PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{LAUNCH_LABEL}.plist"
 
 # ------------------------------------------------------------------------- defaults
 
+# The panel's address has no sensible default: it is whatever DHCP handed your
+# keyboard on your network, and a wrong guess fails as a silent no-op (frames
+# POSTed into the void, an empty screen, nothing in the log that says why). So
+# ship a placeholder that cannot be mistaken for an address and refuse to push
+# until it is replaced -- see require_url.
+URL_UNSET = "http://PANEL-IP-NOT-SET/image/upload"
+
 DEFAULTS = {
-    # Where the keyboard lives. Override in ~/.claude/keyboard-status.json or
+    # Where the keyboard lives. Set it in ~/.claude/keyboard-status.json or
     # with CLAUDE_KEYBOARD_URL; the whole point is that this is not compiled in.
-    "url": "http://192.168.0.12/image/upload",
+    "url": URL_UNSET,
     "width": 142,
     "height": 428,
     # Seconds between renders. The render is ~20 ms, so this is cheap; it sets
@@ -186,6 +193,64 @@ FAILURE_BACKOFF = 120.0
 THROTTLED_BACKOFF = 300.0
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA = "oauth-2025-04-20"
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+TOKEN_SKEW = 60.0
+
+
+def credential_stores():
+    """Every place Claude Code may keep its OAuth credentials, newest last.
+
+    ~/.claude/.credentials.json is only one of two stores. On macOS the app
+    keeps the live credentials in the login Keychain and leaves the file at
+    whatever it last wrote -- here that was a token issued days earlier, long
+    expired, while the Keychain held a valid one. Reading the file alone is the
+    bug that silently emptied the usage meters, so read both and let
+    `oauth_token` choose.
+    """
+    yield sub_dict(read_json(CREDENTIALS_PATH), "claudeAiOauth")
+    if sys.platform != "darwin":
+        return
+    import subprocess
+    try:
+        # -w prints the secret alone. Short timeout: this runs on the daemon's
+        # poll thread, and a Keychain that wants to prompt must not wedge it.
+        proc = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, timeout=5.0)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if proc.returncode != 0:
+        return
+    try:
+        yield sub_dict(json.loads(proc.stdout), "claudeAiOauth")
+    except ValueError:
+        return
+
+
+def oauth_token(now):
+    """The freshest unexpired Claude Code access token, or None.
+
+    Expiry is checked here rather than left to the server because an expired
+    token does not fail usefully: the endpoint answers 401, `poll_usage` treats
+    every failure alike and retries two minutes later, and after days of that
+    the edge starts returning 429 with a ~50 minute Retry-After. The meters go
+    blank and the log stays silent. Prefer a store whose token still has
+    TOKEN_SKEW seconds left; fall back to the longest-lived one we saw, so a
+    store that simply omits `expiresAt` is still tried.
+    """
+    best = None
+    for store in credential_stores():
+        token = store.get("accessToken")
+        if not isinstance(token, str) or not token:
+            continue
+        expires = store.get("expiresAt")
+        # Milliseconds since the epoch, as Claude Code writes it.
+        expires = expires / 1000.0 if isinstance(expires, (int, float)) else 0.0
+        if expires and expires <= now + TOKEN_SKEW:
+            continue  # expired or about to be: not worth a 401
+        if best is None or expires > best[0]:
+            best = (expires, token)
+    return best[1] if best else None
 
 
 def normalize(entry):
@@ -290,7 +355,7 @@ def poll_usage(now, timeout=8.0):
         cache = read_json(USAGE_CACHE_PATH)
         if now < cache.get("retry_after", 0):
             return
-        token = sub_dict(read_json(CREDENTIALS_PATH), "claudeAiOauth").get("accessToken")
+        token = oauth_token(now)
         if not token:
             return
         request = urllib.request.Request(
@@ -1746,6 +1811,28 @@ USAGE = """usage: keyboard_status.py [command]
 """
 
 
+def require_url(config):
+    """Stop, loudly, before pushing frames at a placeholder.
+
+    Returns an exit code when the address is unset and None when it is fine, so
+    callers can `return code` without a second branch.
+    """
+    if URL_UNSET not in config["url"]:
+        return None
+    sys.stderr.write(
+        "The keyboard's address is not set yet.\n"
+        "\n"
+        f"Edit {CONFIG_PATH} and set `url` to your panel's own address:\n"
+        "\n"
+        '    {"url": "http://192.168.1.50/image/upload"}\n'
+        "\n"
+        "Find it on the keyboard's own display or settings app, or look for a\n"
+        "new device in your router's client list. Then restart the daemon:\n"
+        "\n"
+        f"    launchctl kickstart -k gui/{os.getuid()}/{LAUNCH_LABEL}\n")
+    return 2
+
+
 def main(argv):
     config = load_config()
     command = argv[1] if len(argv) > 1 else "--help"
@@ -1758,6 +1845,10 @@ def main(argv):
     if command == "--uninstall":
         uninstall()
         return 0
+    if command in ("--daemon", "--once"):
+        code = require_url(config)
+        if code is not None:
+            return code
     if command == "--daemon":
         log(f"starting: {config['url']} every {config['tick_seconds']:g}s")
         return run_daemon(config)
@@ -1786,3 +1877,5 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
+
+
