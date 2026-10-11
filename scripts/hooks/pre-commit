@@ -1,0 +1,13 @@
+#!/bin/sh
+# Refuses a commit whose staged changes carry a secret (token, key, password): gitleaks over the staged diff, with the
+# values redacted in its report. Turned on per clone with: git config core.hooksPath scripts/hooks
+# A false positive: put a `gitleaks:allow` comment on that line. git commit --no-verify skips the check; don't.
+set -eu
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: gitleaks is not installed (brew install gitleaks); not committing unchecked" >&2
+  exit 1
+fi
+if ! gitleaks git --pre-commit --staged --redact --no-banner --log-level warn -v >&2; then
+  echo "pre-commit: gitleaks found a secret in the staged changes (redacted above); take it out of the commit" >&2
+  exit 1
+fi
