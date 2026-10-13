@@ -45,16 +45,6 @@ device in your router's client list. A wrong address fails as silence — frames
 POSTed into the void — which is why an unset one stops the daemon outright
 rather than letting it look like it is working.
 
-**Want the context-aware screens instead?**
-[context-keyboard-display](https://github.com/williamliu0516/context-keyboard-display)
-supersedes this daemon as the panel's pusher, imports this repo as its library,
-and its one-command install asks for the address, sets up both halves, and needs
-no separate install of this one:
-
-```sh
-curl -fsSL https://xiaweiliu.com/context-keyboard-display/install.sh | sh
-```
-
 <details>
 <summary>Install from a clone, or without hooks</summary>
 
@@ -461,11 +451,9 @@ layout looks the way it does.
 
 **The panel speaks plain HTTP**, so frames leave unencrypted and
 unauthenticated: anyone on the same network can read them off the wire, or POST
-their own image to the display. This daemon's own screens carry only a state
-word, a model name and usage percentages — but
-[context-keyboard-display](https://github.com/williamliu0516/context-keyboard-display),
-which imports this repo as a library, renders your live TODO item's *text* onto
-the same panel. Fine on a home network; think twice on shared Wi-Fi.
+their own image to the display. The screens carry only a state word, a model
+name and usage percentages, so there is little to read, but on shared Wi-Fi
+anyone can still put their own picture on the panel.
 
 **The usage meters read your Claude Code OAuth token** from the login Keychain
 and `~/.claude/.credentials.json`, and send it to `api.anthropic.com` and

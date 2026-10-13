@@ -4,6 +4,7 @@ One line per change, added in the same commit, newest first. The full diff is in
 
 ## Unreleased
 
+- README: drop the context-keyboard-display pointers (that repo is private now).
 - `scripts/check.sh` (compile + every state renders) and a gitleaks pre-commit hook (`scripts/hooks/pre-commit`).
 - AGENTS.md (CLAUDE.md imports it): notes for coding agents.
 
